@@ -40,9 +40,13 @@ using namespace firrtl;
 // Utilities
 //===----------------------------------------------------------------------===//
 
+namespace {
+
 /// An absolute instance path.
 using InstancePathRef = ArrayRef<InstanceOp>;
 using InstancePath = SmallVector<InstanceOp>;
+
+} // namespace
 
 template <typename T>
 static T &operator<<(T &os, InstancePathRef path) {
