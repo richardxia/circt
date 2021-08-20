@@ -18,7 +18,9 @@
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "llvm/ADT/PointerSumType.h"
 #include "llvm/ADT/StringSwitch.h"
+#include <variant>
 
 using namespace circt;
 using namespace firrtl;
@@ -26,6 +28,57 @@ using namespace firrtl;
 //===----------------------------------------------------------------------===//
 // Pass Implementation
 //===----------------------------------------------------------------------===//
+
+struct Element {
+  enum ElementKind { Bundle, Vector, Ground };
+
+  const ElementKind kind;
+
+  StringRef name;
+
+  uint64_t storage;
+
+  ElementKind getKind() const { return kind; }
+};
+
+struct BundleKind : public Element {
+  BundleKind(StringRef name) : Element({ElementKind::Bundle, name, 0}) {}
+  static bool classof(const Element *e) {
+    return e->getKind() == ElementKind::Bundle;
+  }
+};
+
+struct VectorKind : public Element {
+  VectorKind(StringRef name, uint64_t depth)
+      : Element({ElementKind::Vector, name, depth}) {}
+  static bool classof(const Element *e) {
+    return e->getKind() == ElementKind::Vector;
+  }
+  uint64_t getDepth() const { return storage; }
+};
+
+class GroundKind : public Element {
+public:
+  GroundKind(StringRef name, uint64_t width)
+      : Element({ElementKind::Ground, name, width}) {}
+  static bool classof(const Element *e) {
+    return e->getKind() == ElementKind::Ground;
+  }
+  uint64_t getWidth() const { return storage; }
+};
+
+inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                     const Element element) {
+  TypeSwitch<const Element *>(&element)
+      .Case<BundleKind>([&](auto a) { os << "BUNDLE -> " << a->name; })
+      .Case<VectorKind>([&](auto a) {
+        os << "VECTOR -> name: " << a->name << ", depth: " << a->getDepth();
+      })
+      .Case<GroundKind>([&](auto a) {
+        os << "GROUND -> name: " << a->name << ", width: " << a->getWidth();
+      });
+  return os;
+};
 
 namespace {
 /// Mutable store of information about an Element in an interface.  This is
@@ -79,6 +132,8 @@ struct AugmentedField {
   StringRef description;
   /// The "type" of the field.
   ElementInfo::Kind tpe;
+  /// An optional global identifier.
+  IntegerAttr id;
 };
 
 /// Stores a decoded Grand Central AugmentedBundleType.
@@ -87,7 +142,68 @@ struct AugmentedBundleType {
   StringRef defName;
   /// The elements that make up the body of the interface.
   SmallVector<AugmentedField> elements;
+  /// An optional global identifier.
+  IntegerAttr id;
 };
+
+inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                     const ElementInfo::Kind tpe) {
+  switch (tpe) {
+  case ElementInfo::Error:
+    os << "error";
+    break;
+  case ElementInfo::Ground:
+    os << "ground";
+    break;
+  case ElementInfo::Vector:
+    os << "vector";
+    break;
+  case ElementInfo::Bundle:
+    os << "bundle";
+    break;
+  case ElementInfo::String:
+    os << "string";
+    break;
+  case ElementInfo::Boolean:
+    os << "boolean";
+    break;
+  case ElementInfo::Integer:
+    os << "integer";
+    break;
+  case ElementInfo::Double:
+    os << "double";
+    break;
+  }
+  return os;
+};
+
+inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                     const AugmentedBundleType iface) {
+  os << "iface:\n"
+     << "  defName: " << iface.defName << "\n"
+     << "  id: " << iface.id << "\n"
+     << "  elements:\n";
+  for (size_t i = 0, e = iface.elements.size(); i != e; i++) {
+    auto element = iface.elements[i];
+    os << "    - name: " << element.name << "\n"
+       << "      id: " << element.id << "\n"
+       << "      description: " << element.description << "\n"
+       << "      tpe: " << element.tpe;
+    if (i < e - 1)
+      os << "\n";
+  }
+  return os;
+};
+
+// enum IDKind { Parent, Companion, Element };
+
+// using llvm::PointerSumType;
+// using llvm::PointerSumTypeMember;
+
+// typedef PointerSumType<IDKind, PointerSumTypeMember<Parent, Operation *>,
+//                        PointerSumTypeMember<Companion, Operation *>,
+//                        PointerSumTypeMember<Element, Operation *>>
+//     IDSum;
 
 /// Stores the information content of an ExtractGrandCentralAnnotation.
 struct ExtractionInfo {
@@ -101,58 +217,13 @@ struct ExtractionInfo {
   StringRef bindFilename;
 };
 
-/// Convert an arbitrary attributes into an optional AugmentedField.  Returns
-/// None if the attribute is an invalid AugmentedField.
-static Optional<AugmentedField> decodeField(Attribute maybeField) {
-  auto field = maybeField.dyn_cast_or_null<DictionaryAttr>();
-  if (!field)
-    return {};
-  auto tpeString = field.getAs<StringAttr>("tpe");
-  auto name = field.getAs<StringAttr>("name");
-  if (!name || !tpeString)
-    return {};
-  auto tpe = llvm::StringSwitch<ElementInfo::Kind>(tpeString.getValue())
-                 .Case("sifive.enterprise.grandcentral.AugmentedBundleType",
-                       ElementInfo::Bundle)
-                 .Case("sifive.enterprise.grandcentral.AugmentedVectorType",
-                       ElementInfo::Vector)
-                 .Case("sifive.enterprise.grandcentral.AugmentedGroundType",
-                       ElementInfo::Ground)
-                 .Case("sifive.enterprise.grandcentral.AugmentedStringType",
-                       ElementInfo::String)
-                 .Case("sifive.enterprise.grandcentral.AugmentedBooleanType",
-                       ElementInfo::Boolean)
-                 .Case("sifive.enterprise.grandcentral.AugmentedIntegerType",
-                       ElementInfo::Integer)
-                 .Case("sifive.enterprise.grandcentral.AugmentedDoubleType",
-                       ElementInfo::Double)
-                 .Default(ElementInfo::Error);
-  if (tpe == ElementInfo::Error)
-    return {};
+struct CompanionInfo {
+  StringRef name;
 
-  StringRef description = {};
-  if (auto maybeDescription = field.getAs<StringAttr>("description"))
-    description = maybeDescription.getValue();
-  return Optional<AugmentedField>({name.getValue(), description, tpe});
-}
+  FModuleOp companion;
 
-/// Convert an Annotation into an optional AugmentedBundleType.  Returns None if
-/// the annotation is not an AugmentedBundleType.
-static Optional<AugmentedBundleType> decodeBundleType(Annotation anno) {
-  auto defName = anno.getMember<StringAttr>("defName");
-  auto elements = anno.getMember<ArrayAttr>("elements");
-  if (!defName || !elements)
-    return {};
-  AugmentedBundleType bundle(
-      {defName.getValue(), SmallVector<AugmentedField>()});
-  for (auto element : elements) {
-    auto field = decodeField(element);
-    if (!field)
-      return {};
-    bundle.elements.push_back(field.getValue());
-  }
-  return Optional<AugmentedBundleType>(bundle);
-}
+  FModuleOp mapping;
+};
 
 /// Remove Grand Central Annotations associated with SystemVerilog interfaces
 /// that should emitted.  This pass works in three major phases:
@@ -185,20 +256,31 @@ struct GrandCentralPass : public GrandCentralBase<GrandCentralPass> {
   typedef DenseMap<std::pair<StringRef, StringRef>, ElementInfo> InterfaceMap;
 
 private:
-  // Store a mapping of interface name to InterfaceOp.
-  llvm::StringMap<sv::InterfaceOp> interfaces;
+  // Mapping of ID to leaf graound type associated with that ID.
+  llvm::DenseMap<Attribute, Operation *> leafMap;
 
-  // Discovered interfaces that need to be constructed.
-  InterfaceMap interfaceMap;
+  // Mapping of ID to parent instance and module.
+  llvm::DenseMap<Attribute, std::pair<InstanceOp, FModuleOp>> parentIDMap;
 
-  // Track the order that interfaces should be emitted in.
-  SmallVector<std::pair<StringRef, StringRef>> interfaceKeys;
+  // Mapping of ID to companion module.
+  llvm::DenseMap<Attribute, CompanionInfo> companionIDMap;
 
-  llvm::StringMap<std::pair<StringRef, Operation *>> companionMap;
+  bool unfoldField(Attribute maybeField, SmallVector<Element> &tpe,
+                   IntegerAttr id, Twine path, bool buildIFace = false);
 
-  llvm::StringMap<FModuleOp> mappingMap;
+  bool unfoldBundle(Annotation anno, IntegerAttr id = {}, Twine path = {},
+                    bool buildIFace = false);
 
-  llvm::StringMap<StringAttr> interfaceInstanceMap;
+  std::variant<std::string, Type> computeType(ArrayRef<Element> elements,
+                                              OpBuilder &builder);
+
+  // Inforamtion about how the circuit should be extracted.  This will be
+  // non-empty if an extraction annotation is found.
+  llvm::Optional<ExtractionInfo> maybeExtractInfo = None;
+
+  StringRef getOutputDirectory() {
+    return maybeExtractInfo ? maybeExtractInfo.getValue().directory : ".";
+  }
 };
 
 class GrandCentralVisitor : public FIRRTLVisitor<GrandCentralVisitor> {
@@ -427,18 +509,264 @@ void GrandCentralVisitor::visitDecl(InstanceOp op) {
   visitUnhandledDecl(op);
 }
 
+bool GrandCentralPass::unfoldField(Attribute maybeField,
+                                   SmallVector<Element> &tpe, IntegerAttr id,
+                                   Twine path, bool buildIFace) {
+  assert(id && "id must be something inside unfoldField");
+
+  auto field = maybeField.dyn_cast_or_null<DictionaryAttr>();
+  if (!field)
+    return false;
+  auto clazz = field.getAs<StringAttr>("class");
+  if (!clazz)
+    return false;
+  switch (llvm::StringSwitch<ElementInfo::Kind>(clazz.getValue())
+              .Case("sifive.enterprise.grandcentral.AugmentedBundleType",
+                    ElementInfo::Bundle)
+              .Case("sifive.enterprise.grandcentral.AugmentedVectorType",
+                    ElementInfo::Vector)
+              .Case("sifive.enterprise.grandcentral.AugmentedGroundType",
+                    ElementInfo::Ground)
+              .Case("sifive.enterprise.grandcentral.AugmentedStringType",
+                    ElementInfo::String)
+              .Case("sifive.enterprise.grandcentral.AugmentedBooleanType",
+                    ElementInfo::Boolean)
+              .Case("sifive.enterprise.grandcentral.AugmentedIntegerType",
+                    ElementInfo::Integer)
+              .Case("sifive.enterprise.grandcentral.AugmentedDoubleType",
+                    ElementInfo::Double)
+              .Default(ElementInfo::Error)) {
+  case ElementInfo::Bundle: {
+    auto name = field.getAs<StringAttr>("defName");
+    if (!name)
+      return false;
+    if (buildIFace)
+      tpe.push_back(std::move(BundleKind(name.getValue())));
+    return unfoldBundle(Annotation(field), id, path, buildIFace);
+  }
+  case ElementInfo::Vector: {
+    auto name = field.getAs<StringAttr>("name");
+    if (!name)
+      return false;
+    auto elements = field.getAs<ArrayAttr>("elements");
+    if (!elements)
+      return false;
+    if (buildIFace)
+      tpe.push_back(
+          std::move(VectorKind(name.getValue(), elements.getValue().size())));
+    bool failed = true;
+    for (size_t i = 0, e = elements.size(); i != e; ++i) {
+      failed &= unfoldField(elements[i], tpe, id, path + "[" + Twine(i) + "]",
+                            (i == 0) && buildIFace);
+    }
+    return failed;
+  }
+  case ElementInfo::Ground: {
+    auto name = field.getAs<StringAttr>("name");
+    if (!name)
+      return false;
+    auto groundID = field.getAs<IntegerAttr>("id");
+    if (!groundID)
+      return false;
+
+    auto builder =
+        OpBuilder::atBlockEnd(companionIDMap.lookup(id).mapping.getBodyBlock());
+
+    builder.create<sv::VerbatimOp>(
+        getOperation().getLoc(), "assign " + path + " = " +
+                                     parentIDMap.lookup(id).first.name() + "." +
+                                     leafMap.lookup(groundID)
+                                         ->getAttr("name")
+                                         .cast<StringAttr>()
+                                         .getValue() +
+                                     ";");
+
+    auto *groundOp = leafMap.lookup(groundID);
+    if (!groundOp)
+      return false;
+    auto width = groundOp->getResult(0)
+                     .getType()
+                     .cast<FIRRTLType>()
+                     .getBitWidthOrSentinel();
+    if (buildIFace)
+      tpe.push_back(GroundKind(name.getValue(), width));
+    return true;
+  }
+  case ElementInfo::Error:
+    return false;
+  default:
+    break;
+  }
+
+  // Compute the instantiation name which is "defName" for BundleType and "name"
+  // for anything else.
+  auto name = field.getAs<StringAttr>("name");
+  if (!name)
+    name = field.getAs<StringAttr>("defName");
+  if (!name)
+    return false;
+
+  StringRef description = {};
+  if (auto maybeDescription = field.getAs<StringAttr>("description"))
+    description = maybeDescription.getValue();
+
+  return true;
+}
+
+/// Unfold an annotation containing an AugmentedBundleType into a sequence of
+/// AugmentedBundleTypes that it contains.  Returns false if the input
+/// annotation was not a legal AugmentedBundleType..
+bool GrandCentralPass::unfoldBundle(Annotation anno, IntegerAttr id, Twine path,
+                                    bool buildIFace) {
+
+  auto defName = anno.getMember<StringAttr>("defName");
+  auto elements = anno.getMember<ArrayAttr>("elements");
+  if (!defName || !elements)
+    return false;
+  // Set the ID if it is not already set.  Only the outermost BundleType will
+  // have an ID set.
+  auto isRoot = false;
+  if (!id) {
+    isRoot = true;
+    id = anno.getMember<IntegerAttr>("id");
+    if (!id)
+      return false;
+  }
+
+  auto loc = getOperation().getLoc();
+  auto builder = OpBuilder::atBlockEnd(getOperation().getBody());
+  auto *ctx = builder.getContext();
+  Operation *iface;
+  if (buildIFace) {
+    iface = builder.create<sv::InterfaceOp>(loc, defName.getValue());
+    iface->setAttr("output_file",
+                   hw::OutputFileAttr::get(
+                       StringAttr::get(ctx, getOutputDirectory()),
+                       StringAttr::get(ctx, defName.getValue() + ".sv"),
+                       BoolAttr::get(ctx, true), BoolAttr::get(ctx, true),
+                       ctx));
+
+    // If this is the root interface, then it needs to be instantiated in the
+    // parent.
+    if (isRoot) {
+      builder.setInsertionPointToEnd(
+          parentIDMap.lookup(id).second.getBodyBlock());
+      auto instance = builder.create<sv::InterfaceInstanceOp>(
+          loc, cast<sv::InterfaceOp>(iface).getInterfaceType(),
+          companionIDMap.lookup(id).name,
+          builder.getStringAttr("__" + companionIDMap.lookup(id).name + "_" +
+                                defName.getValue() + "__"));
+
+      // If there was no bind file passed in, then we're not supposed to
+      // extract this.  Delete the annotation and continue.
+      if (maybeExtractInfo) {
+
+        instance->setAttr("doNotPrint", builder.getBoolAttr(true));
+        builder.setInsertionPointToStart(
+            instance->getParentOfType<ModuleOp>().getBody());
+        auto bind = builder.create<sv::BindInterfaceOp>(
+            loc, builder.getSymbolRefAttr(instance.sym_name().getValue()));
+        bind->setAttr(
+            "output_file",
+            hw::OutputFileAttr::get(
+                builder.getStringAttr(""),
+                builder.getStringAttr(maybeExtractInfo.getValue().bindFilename),
+                /*exclude_from_filelist=*/builder.getBoolAttr(true),
+                /*exclude_replicated_ops=*/builder.getBoolAttr(true),
+                bind.getContext()));
+      }
+    }
+
+    builder.setInsertionPointToEnd(cast<sv::InterfaceOp>(iface).getBodyBlock());
+  }
+
+  for (auto element : elements) {
+    auto field = element.dyn_cast_or_null<DictionaryAttr>();
+    if (!field)
+      return false;
+    auto clazz = field.getAs<StringAttr>("class");
+    if (!clazz)
+      return false;
+    auto name = field.getAs<StringAttr>("name");
+    if (!name)
+      return false;
+
+    SmallVector<Element> tpe;
+    auto fields = unfoldField(element, tpe, id,
+                              path.isTriviallyEmpty()
+                                  ? defName.getValue() + "." + name.getValue()
+                                  : path + "." + name.getValue(),
+                              buildIFace);
+    if (!fields)
+      return false;
+
+    std::vector<Element> bar;
+    for (auto a : tpe)
+      bar.push_back(a);
+
+    if (buildIFace) {
+      auto description = field.getAs<StringAttr>("description");
+      if (description)
+        builder.create<sv::VerbatimOp>(loc,
+                                       ("// " + description.getValue()).str());
+
+      std::variant<std::string, Type> foo = computeType(bar, builder);
+
+      if (std::holds_alternative<std::string>(foo))
+        builder.create<sv::VerbatimOp>(loc, std::get<0>(foo));
+      else
+        builder.create<sv::InterfaceSignalOp>(
+            getOperation().getLoc(), name.getValue(), std::get<1>(foo));
+    }
+  }
+
+  if (buildIFace)
+    llvm::errs() << *iface << "\n";
+
+  return true;
+}
+
+std::variant<std::string, Type>
+GrandCentralPass::computeType(ArrayRef<Element> elements, OpBuilder &builder) {
+
+  bool stringEmission = false;
+  std::string str = "";
+  llvm::raw_string_ostream s(str);
+  Type tpe;
+  for (auto element : llvm::reverse(elements)) {
+    TypeSwitch<Element *>(&element)
+        .Case<GroundKind>([&](auto a) {
+          tpe = builder.getIntegerType(a->getWidth());
+          return;
+        })
+        .Case<VectorKind>([&](auto a) {
+          if (stringEmission) {
+            s << "[" << a->getDepth() << "]";
+            return;
+          }
+          tpe = hw::UnpackedArrayType::get(tpe, a->getDepth());
+          return;
+        })
+        .Case<BundleKind>([&](auto a) {
+          stringEmission = true;
+          s << a->name << " " << a->name;
+        });
+  }
+
+  if (stringEmission) {
+    s << ";";
+    return str;
+  }
+
+  return tpe;
+}
+
 void GrandCentralPass::runOnOperation() {
   CircuitOp circuitOp = getOperation();
 
   AnnotationSet annotations(circuitOp);
   if (annotations.empty())
     return;
-
-  // Setup the builder to create ops _inside the FIRRTL circuit_.  This is
-  // necessary because interfaces and interface instances are created.
-  // Instances link to their definitions via symbols and we don't want to break
-  // this.
-  auto builder = OpBuilder::atBlockEnd(circuitOp.getBody());
 
   // Utility that acts like emitOpError, but does _not_ include a note.  The
   // note in emitOpError includes the entire op which means the **ENTIRE**
@@ -448,11 +776,8 @@ void GrandCentralPass::runOnOperation() {
     return emitError(circuitOp.getLoc(), message);
   };
 
-  // Examine the Circuit's Annotations doing work to remove Grand Central
-  // Annotations.  Ignore any unprocesssed annotations and rewrite the Circuit's
-  // Annotations with these when done.
+  // Pull out the extraction info if it exists.
   bool removalError = false;
-  llvm::Optional<ExtractionInfo> maybeExtractInfo;
   annotations.removeAnnotations([&](Annotation anno) {
     if (anno.isClass(
             "sifive.enterprise.grandcentral.ExtractGrandCentralAnnotation")) {
@@ -467,14 +792,211 @@ void GrandCentralPass::runOnOperation() {
                           anno.getMember<StringAttr>("filename").getValue()};
       return false;
     }
+    return false;
+  });
 
+  if (removalError)
+    return signalPassFailure();
+
+  llvm::errs() << "Extraction Info:\n";
+  if (maybeExtractInfo)
+    llvm::errs() << "  directory: " << maybeExtractInfo.getValue().directory
+                 << "\n"
+                 << "  filename: " << maybeExtractInfo.getValue().bindFilename
+                 << "\n";
+  else
+    llvm::errs() << "  <none>\n";
+
+  // Setup the builder to create ops _inside the FIRRTL circuit_.  This is
+  // necessary because interfaces and interface instances are created.
+  // Instances link to their definitions via symbols and we don't want to break
+  // this.
+  auto builder = OpBuilder::atBlockEnd(circuitOp.getBody());
+
+  SymbolTable symbolTable(circuitOp);
+
+  removalError = false;
+  circuitOp.walk([&](Operation *op) {
+    TypeSwitch<Operation *>(op)
+        .Case<RegOp, RegResetOp, WireOp, NodeOp>([&](auto op) {
+          AnnotationSet annotations = AnnotationSet(op);
+          annotations.removeAnnotations([&](Annotation annotation) {
+            if (!annotation.isClass(
+                    "sifive.enterprise.grandcentral.AugmentedGroundType"))
+              return false;
+
+            auto id = annotation.getMember<IntegerAttr>("id");
+            if (!id) {
+              op.emitOpError()
+                  << "contained a malformed "
+                     "'sifive.enterprise.grandcentral.AugmentedGroundType' "
+                     "annotation that did not contain an 'id' field";
+              removalError = true;
+              return false;
+            }
+
+            leafMap.insert({id, op});
+
+            return true;
+          });
+          annotations.applyToOperation(op);
+        })
+        .Case<FModuleOp>([&](auto op) {
+          AnnotationSet annotations = AnnotationSet(op);
+          annotations.removeAnnotations([&](Annotation annotation) {
+            if (!annotation.isClass(
+                    "sifive.enterprise.grandcentral.ViewAnnotation"))
+              return false;
+            auto tpe = annotation.getMember<StringAttr>("type");
+            auto id = annotation.getMember<IntegerAttr>("id");
+            auto name = annotation.getMember<StringAttr>("name");
+            if (!tpe) {
+              op.emitOpError()
+                  << "has a malformed "
+                     "'sifive.enterprise.grandcentral.ViewAnnotation' that did "
+                     "not contain a 'type' field with a 'StringAttr' value";
+              goto FModuleOp_error;
+            }
+            if (!id) {
+              op.emitOpError()
+                  << "has a malformed "
+                     "'sifive.enterprise.grandcentral.ViewAnnotation' that did "
+                     "not contain an 'id' field with an 'IntegerAttr' value";
+              goto FModuleOp_error;
+            }
+            if (!name) {
+              op.emitOpError()
+                  << "has a malformed "
+                     "'sifive.enterprise.grandcentral.ViewAnnotation' that did "
+                     "not contain a 'name' field with a 'StringAttr' value";
+              goto FModuleOp_error;
+            }
+            if (tpe.getValue() == "companion") {
+              auto mapping = builder.create<FModuleOp>(
+                  circuitOp.getLoc(),
+                  builder.getStringAttr(name.getValue() + "_mapping"),
+                  SmallVector<ModulePortInfo>({}));
+              auto *ctx = builder.getContext();
+              mapping->setAttr(
+                  "output_file",
+                  hw::OutputFileAttr::get(
+                      StringAttr::get(ctx, getOutputDirectory()),
+                      StringAttr::get(ctx, mapping.getName() + ".sv"),
+                      BoolAttr::get(ctx, true), BoolAttr::get(ctx, true), ctx));
+              companionIDMap.insert({id, {name.getValue(), op, mapping}});
+
+              auto instances = symbolTable.getSymbolUses(op, circuitOp);
+              if (!instances) {
+                op.emitOpError()
+                    << "is not instantiated in the design, but must be for "
+                       "Grand Central to prop";
+                return false;
+              }
+
+              if (std::distance(instances.getValue().begin(),
+                                instances.getValue().end()) != 1) {
+                auto diag = op.emitOpError()
+                            << "is instantiate more than once, Grand "
+                               "Central doesn't know how to handle this";
+                for (auto instance : instances.getValue())
+                  diag.attachNote(instance.getUser()->getLoc())
+                      << "parent is instantiated here";
+                return false;
+              }
+
+              auto instance =
+                  cast<InstanceOp>((*(instances.getValue().begin())).getUser());
+
+              // If an extraction annotation was found then extract the
+              // interface.
+              if (maybeExtractInfo) {
+                instance->setAttr("lowerToBind", BoolAttr::get(ctx, true));
+                instance->setAttr(
+                    "output_file",
+                    hw::OutputFileAttr::get(
+                        StringAttr::get(ctx, ""),
+                        StringAttr::get(
+                            ctx, maybeExtractInfo.getValue().bindFilename),
+                        /*exclude_from_filelist=*/
+                        BoolAttr::get(ctx, true),
+                        /*exclude_replicated_ops=*/
+                        BoolAttr::get(ctx, true), ctx));
+                op->setAttr("output_file",
+                            hw::OutputFileAttr::get(
+                                StringAttr::get(
+                                    ctx, maybeExtractInfo.getValue().directory),
+                                StringAttr::get(ctx, op.getName() + ".sv"),
+                                /*exclude_from_filelist=*/
+                                BoolAttr::get(ctx, true),
+                                /*exclude_replicated_ops=*/
+                                BoolAttr::get(ctx, true), ctx));
+              }
+              return true;
+            }
+            if (tpe.getValue() == "parent") {
+              auto instances = symbolTable.getSymbolUses(op, circuitOp);
+              if (!instances) {
+                op.emitOpError()
+                    << "is not instantiated in the design, but must be for "
+                       "Grand Central to prop";
+                return false;
+              }
+
+              if (std::distance(instances.getValue().begin(),
+                                instances.getValue().end()) != 1) {
+                auto diag = op.emitOpError()
+                            << "is instantiate more than once, Grand "
+                               "Central doesn't know how to handle this";
+                for (auto instance : instances.getValue())
+                  diag.attachNote(instance.getUser()->getLoc())
+                      << "parent is instantiated here";
+                return false;
+              }
+
+              auto instance =
+                  cast<InstanceOp>((*(instances.getValue().begin())).getUser());
+
+              parentIDMap.insert({id, {instance, cast<FModuleOp>(op)}});
+              return true;
+            }
+            op.emitOpError()
+                << "has a 'sifive.enterprise.grandcentral.ViewAnnotation' with "
+                   "an unknown 'type' field";
+          FModuleOp_error:
+            removalError = true;
+            return false;
+          });
+        });
+  });
+
+  if (removalError)
+    return signalPassFailure();
+
+  llvm::errs() << "companionIDMap:\n";
+  for (auto a : companionIDMap)
+    llvm::errs() << "  - " << a.first.cast<IntegerAttr>().getValue() << ": "
+                 << a.second.companion.getName() << " -> " << a.second.name
+                 << "\n";
+
+  llvm::errs() << "parentIDMap:\n";
+  for (auto a : parentIDMap)
+    llvm::errs() << "  - " << a.first.cast<IntegerAttr>().getValue() << ": "
+                 << a.second.first.name() << ":" << a.second.second.getName()
+                 << "\n";
+
+  llvm::errs() << "leafMap:\n";
+  for (auto a : leafMap)
+    llvm::errs() << "  - " << a.first.cast<IntegerAttr>().getValue() << ": "
+                 << (*a.second).getAttr("name") << "\n";
+
+  // Generate everything.
+  annotations.removeAnnotations([&](Annotation anno) {
     if (!anno.isClass("sifive.enterprise.grandcentral.AugmentedBundleType"))
       return false;
 
     AugmentedBundleType bundle;
-    if (auto maybeBundle = decodeBundleType(anno))
-      bundle = maybeBundle.getValue();
-    else {
+    auto id = anno.getMember<IntegerAttr>("id");
+    if (!unfoldBundle(anno, {}, companionIDMap.lookup(id).name, true)) {
       emitCircuitError(
           "'firrtl.circuit' op contained an 'AugmentedBundleType' "
           "Annotation which did not conform to the expected format")
@@ -485,20 +1007,6 @@ void GrandCentralPass::runOnOperation() {
       return false;
     }
 
-    for (auto elt : bundle.elements) {
-      std::pair<StringRef, StringRef> key = {bundle.defName, elt.name};
-      interfaceMap[key] = {elt.tpe, elt.description};
-      interfaceKeys.push_back(key);
-    }
-
-    // If the interface already exists, don't create it.
-    if (interfaces.count(bundle.defName))
-      return true;
-
-    // Create the interface.  This will be populated later.
-    interfaces[bundle.defName] =
-        builder.create<sv::InterfaceOp>(circuitOp->getLoc(), bundle.defName);
-
     return true;
   });
 
@@ -507,213 +1015,6 @@ void GrandCentralPass::runOnOperation() {
   if (removalError)
     return signalPassFailure();
 
-  // If no interfaces were found (no AugmentedBundleType annotations were found
-  // on the circuit) and there was no ExtractGrandCentralAnnotations, then this
-  // pass is a no-op.  Just exit.
-  if (interfaces.empty() && !maybeExtractInfo)
-    return;
-
-  // Error if zero ExtractGrandCentralAnnotations were found.
-  if (!maybeExtractInfo) {
-    emitCircuitError(
-        "an 'ExtractGrandCentralAnnotation' must be provided to the Grand "
-        "Central pass, but no such annotation was found");
-    return signalPassFailure();
-  }
-
-  auto getOutputDirectory = [&]() -> StringRef {
-    return maybeExtractInfo ? maybeExtractInfo.getValue().directory : ".";
-  };
-
-  for (auto &ifaceKey : interfaces) {
-    auto iface = ifaceKey.getValue();
-    auto *ctx = iface.getContext();
-    iface->setAttr(
-        "output_file",
-        hw::OutputFileAttr::get(StringAttr::get(ctx, getOutputDirectory()),
-                                StringAttr::get(ctx, ifaceKey.getKey() + ".sv"),
-                                BoolAttr::get(ctx, true),
-                                BoolAttr::get(ctx, true), ctx));
-  }
-
-  // Remove the processed annotations.
-  circuitOp->setAttr("annotations", annotations.getArrayAttr());
-
-  // Walk through the circuit to collect additional information.  If this fails,
-  // signal pass failure.  Walk in reverse order so that annotations can be
-  // removed from modules after all referring instances have consumed their
-  // annotations.
-  for (auto &op : llvm::reverse(circuitOp.getBody()->getOperations())) {
-    // Only process modules or external modules.
-    if (!isa<FModuleOp, FExtModuleOp>(op))
-      continue;
-
-    GrandCentralVisitor visitor(
-        interfaceMap, companionMap,
-        maybeExtractInfo.getValueOr(ExtractionInfo({".", ""})));
-    visitor.visitModule(&op);
-    if (visitor.hasFailed())
-      return signalPassFailure();
-    AnnotationSet annotations(&op);
-
-    annotations.removeAnnotations([&](Annotation anno) {
-      // Insert an instantiated interface.
-      if (anno.getClass() == "sifive.enterprise.grandcentral.ViewAnnotation") {
-
-        auto tpe = anno.getMember<StringAttr>("type");
-        if (tpe && tpe.getValue() == "parent") {
-          auto name = anno.getMember<StringAttr>("name");
-          auto defName = anno.getMember<StringAttr>("defName");
-          interfaceInstanceMap.insert({defName.getValue(), name});
-          auto guard = OpBuilder::InsertionGuard(builder);
-          builder.setInsertionPointToEnd(cast<FModuleOp>(op).getBodyBlock());
-          auto instance = builder.create<sv::InterfaceInstanceOp>(
-              circuitOp->getLoc(),
-              interfaces.lookup(defName.getValue()).getInterfaceType(), name,
-              builder.getStringAttr(
-                  "__" + op.getAttrOfType<StringAttr>("sym_name").getValue() +
-                  "_" + defName.getValue() + "__"));
-
-          // If there was no bind file passed in, then we're not supposed to
-          // extract this.  Delete the annotation and continue.
-          if (!maybeExtractInfo)
-            return true;
-
-          instance->setAttr("doNotPrint", builder.getBoolAttr(true));
-          builder.setInsertionPointToStart(
-              op.getParentOfType<ModuleOp>().getBody());
-          auto bind = builder.create<sv::BindInterfaceOp>(
-              circuitOp->getLoc(),
-              builder.getSymbolRefAttr(instance.sym_name().getValue()));
-          bind->setAttr(
-              "output_file",
-              hw::OutputFileAttr::get(
-                  builder.getStringAttr(""),
-                  builder.getStringAttr(
-                      maybeExtractInfo.getValue().bindFilename),
-                  /*exclude_from_filelist=*/builder.getBoolAttr(true),
-                  /*exclude_replicated_ops=*/builder.getBoolAttr(true),
-                  bind.getContext()));
-        }
-        return true;
-      }
-      // All other annotations pass through unmodified.
-      return false;
-    });
-
-    annotations.applyToOperation(&op);
-  }
-
-  InstancePaths instancePaths(getAnalysis<InstanceGraph>());
-
-  // Populate interfaces.
-  for (auto &a : interfaceKeys) {
-    auto defName = a.first;
-    auto name = a.second;
-
-    auto &info = interfaceMap[{defName, name}];
-    if (info.isMissing()) {
-      emitCircuitError()
-          << "'firrtl.circuit' op contained a Grand Central Interface '"
-          << defName << "' that had an element '" << name
-          << "' which did not have a scattered companion annotation (is there "
-             "an invalid target in your annotation file?)";
-      continue;
-    }
-
-    builder.setInsertionPointToEnd(interfaces[defName].getBodyBlock());
-
-    auto loc = builder.getFusedLoc(info.locations);
-    auto description = info.description;
-    if (!description.empty())
-      builder.create<sv::VerbatimOp>(loc, "\n// " + description);
-
-    Type type;
-    switch (info.tpe) {
-    case ElementInfo::Bundle:
-      // TODO: Change this to actually use an interface type.  This currently
-      // does not work because: (1) interfaces don't have a defined way to get
-      // their bit width and (2) interfaces have a symbol table that is used to
-      // verify internal ops, but this requires looking arbitrarily far upwards
-      // to find other symbols.
-      builder.create<sv::VerbatimOp>(loc, name + " " + name + "();");
-      continue;
-    case ElementInfo::Vector: {
-      type = hw::UnpackedArrayType::get(builder.getIntegerType(info.width),
-                                        info.depth);
-      builder.create<sv::InterfaceSignalOp>(loc, name, type);
-      break;
-    }
-    case ElementInfo::Ground: {
-      type = builder.getIntegerType(info.width);
-      builder.create<sv::InterfaceSignalOp>(loc, name, type);
-      break;
-    }
-    case ElementInfo::String:
-      builder.create<sv::VerbatimOp>(loc, "// " + name +
-                                              " = <unsupported string type>;");
-      continue;
-    case ElementInfo::Boolean:
-      builder.create<sv::VerbatimOp>(loc, "// " + name +
-                                              " = <unsupported boolean type>;");
-      continue;
-    case ElementInfo::Integer:
-      builder.create<sv::VerbatimOp>(loc, "// " + name +
-                                              " = <unsupported integer type>;");
-      continue;
-    case ElementInfo::Double:
-      builder.create<sv::VerbatimOp>(loc, "// " + name +
-                                              " = <unsupported double type>;");
-      continue;
-    case ElementInfo::Error:
-      llvm_unreachable("Shouldn't be here");
-      break;
-    }
-
-    // Add XMRs into the companion module to connect the interface.
-    if (!companionMap.count(defName)) {
-      llvm::errs() << "No companion found for interface '" << defName << "'\n";
-      continue;
-    }
-    auto companion = companionMap.lookup(defName);
-
-    auto &mapping = mappingMap[defName];
-    if (!mapping) {
-      auto companionName = (companion.first + "_mapping").str();
-      builder.setInsertionPoint(companion.second);
-      mapping =
-          builder.create<FModuleOp>(loc, builder.getStringAttr(companionName),
-                                    SmallVector<ModulePortInfo>({}));
-      if (maybeExtractInfo) {
-        auto *ctx = builder.getContext();
-        mapping->setAttr(
-            "output_file",
-            hw::OutputFileAttr::get(
-                StringAttr::get(ctx, maybeExtractInfo.getValue().directory),
-                StringAttr::get(ctx, mapping.getName() + ".sv"),
-                BoolAttr::get(ctx, true), BoolAttr::get(ctx, true), ctx));
-      }
-      builder.setInsertionPointToEnd(
-          cast<FModuleOp>(companion.second).getBodyBlock());
-      builder.create<InstanceOp>(loc, SmallVector<Type>({}), companionName,
-                                 companionName);
-    }
-    builder.setInsertionPointToEnd(mapping.getBodyBlock());
-    auto srcPaths =
-        instancePaths.getAbsolutePaths(info.op->getParentOfType<FModuleOp>());
-    assert(srcPaths.size() == 1 &&
-           "Unable to handle multiply instantiated companions");
-    SmallString<0> srcRef, destRef;
-    for (auto path : srcPaths[0])
-      srcRef.append((path.name() + ".").str());
-    srcRef.append(info.op->getAttrOfType<StringAttr>("name").getValue());
-    builder.create<sv::VerbatimOp>(loc, "assign " + companion.first + "." +
-                                            name + " = " + srcRef + ";");
-  }
-
-  interfaces.clear();
-  interfaceMap.clear();
-  interfaceKeys.clear();
 }
 
 //===----------------------------------------------------------------------===//
