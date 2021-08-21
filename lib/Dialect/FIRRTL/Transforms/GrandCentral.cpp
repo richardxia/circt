@@ -257,7 +257,7 @@ struct GrandCentralPass : public GrandCentralBase<GrandCentralPass> {
 
 private:
   // Mapping of ID to leaf graound type associated with that ID.
-  llvm::DenseMap<Attribute, Operation *> leafMap;
+  llvm::DenseMap<Attribute, Value> leafMap;
 
   // Mapping of ID to parent instance and module.
   llvm::DenseMap<Attribute, std::pair<InstanceOp, FModuleOp>> parentIDMap;
@@ -271,6 +271,8 @@ private:
   bool unfoldBundle(Annotation anno, IntegerAttr id = {}, Twine path = {},
                     bool buildIFace = false);
 
+  FModuleOp getEnclosingModule(Value value);
+
   std::variant<std::string, Type> computeType(ArrayRef<Element> elements,
                                               OpBuilder &builder);
 
@@ -281,6 +283,8 @@ private:
   StringRef getOutputDirectory() {
     return maybeExtractInfo ? maybeExtractInfo.getValue().directory : ".";
   }
+
+  InstancePaths *instancePathsRef;
 };
 
 class GrandCentralVisitor : public FIRRTLVisitor<GrandCentralVisitor> {
@@ -572,22 +576,38 @@ bool GrandCentralPass::unfoldField(Attribute maybeField,
     auto builder =
         OpBuilder::atBlockEnd(companionIDMap.lookup(id).mapping.getBodyBlock());
 
-    builder.create<sv::VerbatimOp>(
-        getOperation().getLoc(), "assign " + path + " = " +
-                                     parentIDMap.lookup(id).first.name() + "." +
-                                     leafMap.lookup(groundID)
-                                         ->getAttr("name")
-                                         .cast<StringAttr>()
-                                         .getValue() +
-                                     ";");
-
-    auto *groundOp = leafMap.lookup(groundID);
-    if (!groundOp)
+    auto leafValue = leafMap.lookup(groundID);
+    if (!leafValue)
       return false;
-    auto width = groundOp->getResult(0)
-                     .getType()
-                     .cast<FIRRTLType>()
-                     .getBitWidthOrSentinel();
+
+    auto srcPaths =
+        instancePathsRef->getAbsolutePaths(getEnclosingModule(leafValue));
+    assert(srcPaths.size() == 1 &&
+           "Unable to handle multiply instantiated companions");
+    SmallString<0> srcRef;
+    for (auto path : srcPaths[0])
+      srcRef.append((path.name() + ".").str());
+    // srcRef.append(parentIDMap.lookup(id).first.name());
+
+    if (auto blockArg = leafValue.dyn_cast<BlockArgument>()) {
+      FModuleOp module = cast<FModuleOp>(blockArg.getOwner()->getParentOp());
+      builder.create<sv::VerbatimOp>(
+          getOperation().getLoc(),
+          "assign " + path + " = " + srcRef +
+              module.portNames()[blockArg.getArgNumber()]
+                  .cast<StringAttr>()
+                  .getValue() +
+              ";");
+    } else
+      builder.create<sv::VerbatimOp>(getOperation().getLoc(),
+                                     "assign " + path + " = " + srcRef +
+                                         leafValue.getDefiningOp()
+                                             ->getAttr("name")
+                                             .cast<StringAttr>()
+                                             .getValue() +
+                                         ";");
+
+    auto width = leafValue.getType().cast<FIRRTLType>().getBitWidthOrSentinel();
     if (buildIFace)
       tpe.push_back(GroundKind(name.getValue(), width));
     return true;
@@ -726,6 +746,17 @@ bool GrandCentralPass::unfoldBundle(Annotation anno, IntegerAttr id, Twine path,
   return true;
 }
 
+FModuleOp GrandCentralPass::getEnclosingModule(Value value) {
+  if (auto blockArg = value.dyn_cast<BlockArgument>())
+    return cast<FModuleOp>(blockArg.getOwner()->getParentOp());
+
+  auto *op = value.getDefiningOp();
+  if (InstanceOp instance = dyn_cast<InstanceOp>(op))
+    return cast<FModuleOp>(instance.getReferencedModule());
+
+  return op->getParentOfType<FModuleOp>();
+}
+
 std::variant<std::string, Type>
 GrandCentralPass::computeType(ArrayRef<Element> elements, OpBuilder &builder) {
 
@@ -835,13 +866,42 @@ void GrandCentralPass::runOnOperation() {
               return false;
             }
 
-            leafMap.insert({id, op});
+            leafMap.insert({id, op.getResult()});
 
             return true;
           });
           annotations.applyToOperation(op);
         })
-        .Case<FModuleOp>([&](auto op) {
+        .Case<InstanceOp>([&](auto op) {
+          /* Populate the leafMap for ports. */
+        })
+        .Case<FModuleOp>([&](FModuleOp op) {
+          // Handle annotations on the ports.
+          auto ports = op.getPorts();
+          for (size_t i = 0, e = ports.size(); i != e; ++i) {
+            auto annotations = AnnotationSet::forPort(op, i);
+            annotations.removeAnnotations([&](Annotation annotation) {
+              if (!annotation.isClass(
+                      "sifive.enterprise.grandcentral.AugmentedGroundType"))
+                return false;
+
+              auto id = annotation.getMember<IntegerAttr>("id");
+              if (!id) {
+                op.emitOpError()
+                    << "contained a malformed "
+                       "'sifive.enterprise.grandcentral.AugmentedGroundType' "
+                       "annotation that did not contain an 'id' field";
+                removalError = true;
+                return false;
+              }
+
+              leafMap.insert({id, op.getArgument(i)});
+
+              return true;
+            });
+          }
+
+          // Handle annotations on the module.
           AnnotationSet annotations = AnnotationSet(op);
           annotations.removeAnnotations([&](Annotation annotation) {
             if (!annotation.isClass(
@@ -985,9 +1045,28 @@ void GrandCentralPass::runOnOperation() {
                  << "\n";
 
   llvm::errs() << "leafMap:\n";
-  for (auto a : leafMap)
-    llvm::errs() << "  - " << a.first.cast<IntegerAttr>().getValue() << ": "
-                 << (*a.second).getAttr("name") << "\n";
+  for (auto a : leafMap) {
+    if (auto blockArg = a.second.dyn_cast<BlockArgument>()) {
+      FModuleOp module = cast<FModuleOp>(blockArg.getOwner()->getParentOp());
+      llvm::errs() << "  - " << a.first.cast<IntegerAttr>().getValue() << ": "
+                   << module.getName() + ">" +
+                          module.portNames()[blockArg.getArgNumber()]
+                              .cast<StringAttr>()
+                              .getValue()
+                   << "\n";
+    } else {
+      llvm::errs() << "  - " << a.first.cast<IntegerAttr>().getValue() << ": "
+                   << a.second.getDefiningOp()
+                          ->getAttr("name")
+                          .cast<StringAttr>()
+                          .getValue()
+                   << "\n";
+    }
+  }
+
+  InstancePaths instancePaths(getAnalysis<InstanceGraph>());
+
+  instancePathsRef = &instancePaths;
 
   // Generate everything.
   annotations.removeAnnotations([&](Annotation anno) {
@@ -1014,7 +1093,6 @@ void GrandCentralPass::runOnOperation() {
   // annotations.
   if (removalError)
     return signalPassFailure();
-
 }
 
 //===----------------------------------------------------------------------===//
