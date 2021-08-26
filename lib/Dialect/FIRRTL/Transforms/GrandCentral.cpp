@@ -30,7 +30,7 @@ using namespace firrtl;
 //===----------------------------------------------------------------------===//
 
 struct Element {
-  enum ElementKind { Bundle, Vector, Ground };
+  enum ElementKind { Bundle, Vector, Ground, String, Boolean, Integer, Double };
 
   const ElementKind kind;
 
@@ -65,6 +65,34 @@ public:
     return e->getKind() == ElementKind::Ground;
   }
   uint64_t getWidth() const { return storage; }
+};
+
+struct StringKind : public Element {
+  StringKind(StringRef name) : Element({ElementKind::String, name, 0}) {}
+  static bool classof(const Element *e) {
+    return e->getKind() == ElementKind::String;
+  }
+};
+
+struct BooleanKind : public Element {
+  BooleanKind(StringRef name) : Element({ElementKind::Boolean, name, 0}) {}
+  static bool classof(const Element *e) {
+    return e->getKind() == ElementKind::Boolean;
+  }
+};
+
+struct IntegerKind : public Element {
+  IntegerKind(StringRef name) : Element({ElementKind::Integer, name, 0}) {}
+  static bool classof(const Element *e) {
+    return e->getKind() == ElementKind::Integer;
+  }
+};
+
+struct DoubleKind : public Element {
+  DoubleKind(StringRef name) : Element({ElementKind::Double, name, 0}) {}
+  static bool classof(const Element *e) {
+    return e->getKind() == ElementKind::Double;
+  }
 };
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
@@ -286,232 +314,7 @@ private:
 
   InstancePaths *instancePathsRef;
 };
-
-class GrandCentralVisitor : public FIRRTLVisitor<GrandCentralVisitor> {
-public:
-  GrandCentralVisitor(
-      GrandCentralPass::InterfaceMap &interfaceMap,
-      llvm::StringMap<std::pair<StringRef, Operation *>> &companionMap,
-      ExtractionInfo extractionInfo)
-      : interfaceMap(interfaceMap), companionMap(companionMap),
-        extractionInfo(extractionInfo) {}
-
-private:
-  /// Mutable store tracking each element in an interface.  This is indexed by a
-  /// "defName" -> "name" tuple.
-  GrandCentralPass::InterfaceMap &interfaceMap;
-
-  llvm::StringMap<std::pair<StringRef, Operation *>> &companionMap;
-
-  /// Helper to handle wires, registers, and nodes.
-  void handleRef(Operation *op);
-
-  /// A helper used by handleRef that can also be used to process ports.
-  void handleRefLike(Operation *op, AnnotationSet &annotations,
-                     FIRRTLType type);
-
-  // Helper to handle ports of modules that may have Grand Central annotations.
-  void handlePorts(Operation *op);
-
-  // If true, then some error occurred while the visitor was running.  This
-  // indicates that pass failure should occur.
-  bool failed = false;
-
-  // Information about how Grand Central collateral should be extracted.
-  ExtractionInfo extractionInfo;
-
-public:
-  using FIRRTLVisitor<GrandCentralVisitor>::visitDecl;
-
-  /// Visit FModuleOp and FExtModuleOp
-  void visitModule(Operation *op);
-
-  /// Visit ops that can make up an interface element.
-  void visitDecl(RegOp op) { handleRef(op); }
-  void visitDecl(RegResetOp op) { handleRef(op); }
-  void visitDecl(WireOp op) { handleRef(op); }
-  void visitDecl(NodeOp op) { handleRef(op); }
-  void visitDecl(InstanceOp op);
-
-  /// Process all other ops.  Error if any of these ops contain annotations that
-  /// indicate it as being part of an interface.
-  void visitUnhandledDecl(Operation *op);
-
-  /// Returns true if an error condition occurred while visiting ops.
-  bool hasFailed() { return failed; };
-};
-
 } // namespace
-
-void GrandCentralVisitor::visitModule(Operation *op) {
-  handlePorts(op);
-
-  if (auto mod = dyn_cast_or_null<FModuleOp>(op)) {
-    AnnotationSet annotations(op);
-    if (auto anno = annotations.getAnnotation(
-            "sifive.enterprise.grandcentral.ViewAnnotation")) {
-      auto tpe = anno.getAs<StringAttr>("type");
-      if (tpe && tpe.getValue() == "companion") {
-        auto defName = anno.getAs<StringAttr>("defName");
-        auto name = anno.getAs<StringAttr>("name");
-        companionMap.insert_or_assign(defName.getValue(),
-                                      std::make_pair(name.getValue(), op));
-        auto *ctx = op->getContext();
-        op->setAttr("output_file",
-                    hw::OutputFileAttr::get(
-                        StringAttr::get(ctx, extractionInfo.directory),
-                        StringAttr::get(ctx, mod.getName() + ".sv"),
-                        BoolAttr::get(ctx, true), BoolAttr::get(ctx, true),
-                        ctx));
-      }
-    }
-    for (auto &stmt : op->getRegion(0).front())
-      dispatchVisitor(&stmt);
-  }
-}
-
-/// Process all other operations.  This will throw an error if the operation
-/// contains any annotations that indicates that this should be included in an
-/// interface.  Otherwise, this is a valid nop.
-void GrandCentralVisitor::visitUnhandledDecl(Operation *op) {
-  AnnotationSet annotations(op);
-  auto anno = annotations.getAnnotation(
-      "sifive.enterprise.grandcentral.AugmentedGroundType");
-  if (!anno)
-    return;
-  auto diag =
-      op->emitOpError()
-      << "is marked as a an interface element, but this op or its ports are "
-         "not supposed to be interface elements (Are your annotations "
-         "malformed? Is this a missing feature that should be supported?)";
-  diag.attachNote()
-      << "this annotation marked the op as an interface element: '" << anno
-      << "'";
-  failed = true;
-}
-
-/// Process annotations associated with an operation and having some type.
-/// Return the annotations with the processed annotations removed.  If all
-/// annotations are removed, this returns an empty ArrayAttr.
-void GrandCentralVisitor::handleRefLike(mlir::Operation *op,
-                                        AnnotationSet &annotations,
-                                        FIRRTLType type) {
-  if (annotations.empty())
-    return;
-
-  for (auto anno : annotations) {
-    if (!anno.isClass("sifive.enterprise.grandcentral.AugmentedGroundType"))
-      continue;
-
-    auto defName = anno.getMember<StringAttr>("defName");
-    auto name = anno.getMember<StringAttr>("name");
-    if (!defName || !name) {
-      op->emitOpError(
-            "is marked as part of an interface, but is missing 'defName' or "
-            "'name' fields (did you forget to add these?)")
-              .attachNote()
-          << "the full annotation is: " << anno.getDict();
-      failed = true;
-      continue;
-    }
-
-    // TODO: This is ignoring situations where the leaves of and interface are
-    // not ground types.  This enforces the requirement that this runs after
-    // LowerTypes.  However, this could eventually be relaxed.
-    if (!type.isGround()) {
-      auto diag = op->emitOpError()
-                  << "cannot be added to interface '" << defName.getValue()
-                  << "', component '" << name.getValue()
-                  << "' because it is not a ground type. (Got type '" << type
-                  << "'.) This will be dropped from the interface. (Did you "
-                     "forget to run LowerTypes?)";
-      diag.attachNote()
-          << "The annotation indicating that this should be added was: '"
-          << anno.getDict();
-      failed = true;
-      continue;
-    }
-
-    auto &component = interfaceMap[{defName.getValue(), name.getValue()}];
-    component.found = true;
-    component.op = op;
-
-    switch (component.tpe) {
-    case ElementInfo::Vector:
-      component.width = type.getBitWidthOrSentinel();
-      component.depth++;
-      component.locations.push_back(op->getLoc());
-      break;
-    case ElementInfo::Ground:
-      component.width = type.getBitWidthOrSentinel();
-      component.locations.push_back(op->getLoc());
-      break;
-    case ElementInfo::Bundle:
-    case ElementInfo::String:
-    case ElementInfo::Boolean:
-    case ElementInfo::Integer:
-    case ElementInfo::Double:
-      break;
-    case ElementInfo::Error:
-      llvm_unreachable("Shouldn't be here");
-      break;
-    }
-    annotations.removeAnnotation(anno);
-  }
-}
-
-/// Combined logic to handle Wires, Registers, and Nodes because these all use
-/// the same approach.
-void GrandCentralVisitor::handleRef(mlir::Operation *op) {
-  auto annotations = AnnotationSet(op);
-  handleRefLike(op, annotations, op->getResult(0).getType().cast<FIRRTLType>());
-  annotations.applyToOperation(op);
-}
-
-/// Remove Grand Central Annotations from ports of modules or external modules.
-/// Return argument attributes with annotations removed.
-void GrandCentralVisitor::handlePorts(Operation *op) {
-
-  SmallVector<Attribute> newArgAttrs;
-  auto ports = cast<FModuleLike>(op).getPorts();
-  for (size_t i = 0, e = ports.size(); i != e; ++i) {
-    auto port = ports[i];
-    handleRefLike(op, port.annotations, port.type);
-    newArgAttrs.push_back(port.annotations.getArrayAttr());
-  }
-
-  op->setAttr("portAnnotations", ArrayAttr::get(op->getContext(), newArgAttrs));
-}
-
-void GrandCentralVisitor::visitDecl(InstanceOp op) {
-
-  // If this instance's underlying module has a "companion" annotation, then
-  // move this onto the actual instance op.
-  AnnotationSet annotations(op.getReferencedModule());
-  if (auto anno = annotations.getAnnotation(
-          "sifive.enterprise.grandcentral.ViewAnnotation")) {
-    auto tpe = anno.getAs<StringAttr>("type");
-    if (!tpe) {
-      op.getReferencedModule()->emitOpError(
-          "contains a ViewAnnotation that does not contain a \"type\" field");
-      failed = true;
-      return;
-    }
-    if (tpe.getValue() == "companion" && !extractionInfo.bindFilename.empty()) {
-      op->setAttr("lowerToBind", BoolAttr::get(op.getContext(), true));
-      op->setAttr(
-          "output_file",
-          hw::OutputFileAttr::get(
-              StringAttr::get(op.getContext(), ""),
-              StringAttr::get(op.getContext(), extractionInfo.bindFilename),
-              /*exclude_from_filelist=*/BoolAttr::get(op.getContext(), true),
-              /*exclude_replicated_ops=*/BoolAttr::get(op.getContext(), true),
-              op.getContext()));
-    }
-  }
-
-  visitUnhandledDecl(op);
-}
 
 bool GrandCentralPass::unfoldField(Attribute maybeField,
                                    SmallVector<Element> &tpe, IntegerAttr id,
@@ -519,11 +322,15 @@ bool GrandCentralPass::unfoldField(Attribute maybeField,
   assert(id && "id must be something inside unfoldField");
 
   auto field = maybeField.dyn_cast_or_null<DictionaryAttr>();
-  if (!field)
+  if (!field) {
+    llvm::errs() << "non-dictionary field: " << maybeField << "\n";
     return false;
+  }
   auto clazz = field.getAs<StringAttr>("class");
-  if (!clazz)
+  if (!clazz) {
+    llvm::errs() << "missing 'class' in field: " << field << "\n";
     return false;
+  }
   switch (llvm::StringSwitch<ElementInfo::Kind>(clazz.getValue())
               .Case("sifive.enterprise.grandcentral.AugmentedBundleType",
                     ElementInfo::Bundle)
@@ -542,43 +349,44 @@ bool GrandCentralPass::unfoldField(Attribute maybeField,
               .Default(ElementInfo::Error)) {
   case ElementInfo::Bundle: {
     auto name = field.getAs<StringAttr>("defName");
-    if (!name)
+    if (!name) {
+      llvm::errs() << "missing 'defName' in BundleType: " << field << "\n";
       return false;
+    }
     if (buildIFace)
       tpe.push_back(std::move(BundleKind(name.getValue())));
     return unfoldBundle(Annotation(field), id, path, buildIFace);
   }
   case ElementInfo::Vector: {
     auto name = field.getAs<StringAttr>("name");
-    if (!name)
-      return false;
     auto elements = field.getAs<ArrayAttr>("elements");
-    if (!elements)
+    if (!name || !elements) {
+      llvm::errs() << "missing 'name' or 'elements' in VectorType: " << field
+                   << "\n";
       return false;
+    }
     if (buildIFace)
       tpe.push_back(
           std::move(VectorKind(name.getValue(), elements.getValue().size())));
-    bool failed = true;
+    bool notFailed = true;
     for (size_t i = 0, e = elements.size(); i != e; ++i) {
-      failed &= unfoldField(elements[i], tpe, id, path + "[" + Twine(i) + "]",
-                            (i == 0) && buildIFace);
+      notFailed &=
+          unfoldField(elements[i], tpe, id, path + "[" + Twine(i) + "]",
+                      (i == 0) && buildIFace);
     }
-    return failed;
+    return notFailed;
   }
   case ElementInfo::Ground: {
-    auto name = field.getAs<StringAttr>("name");
-    if (!name)
-      return false;
     auto groundID = field.getAs<IntegerAttr>("id");
-    if (!groundID)
+    auto leafValue = leafMap.lookup(groundID);
+    if (!groundID || !leafValue) {
+      llvm::errs() << "missing 'id' or 'leafValue' in GroundType: " << field
+                   << "\n";
       return false;
+    }
 
     auto builder =
         OpBuilder::atBlockEnd(companionIDMap.lookup(id).mapping.getBodyBlock());
-
-    auto leafValue = leafMap.lookup(groundID);
-    if (!leafValue)
-      return false;
 
     auto srcPaths =
         instancePathsRef->getAbsolutePaths(getEnclosingModule(leafValue));
@@ -608,23 +416,69 @@ bool GrandCentralPass::unfoldField(Attribute maybeField,
                                          ";");
 
     auto width = leafValue.getType().cast<FIRRTLType>().getBitWidthOrSentinel();
+    // The name will exist if this is a ground type or a ground type of a bundle
+    // type.  There is expected to be no name if this is a ground type of a
+    // vector type.
+    auto name = field.getAs<StringAttr>("name");
     if (buildIFace)
-      tpe.push_back(GroundKind(name.getValue(), width));
+      tpe.push_back(GroundKind(name ? name.getValue() : "_", width));
     return true;
   }
-  case ElementInfo::Error:
+  case ElementInfo::String: {
+    auto name = field.getAs<StringAttr>("name");
+    if (!name) {
+      llvm::errs() << "string element missing 'name'\n";
+      return false;
+    }
+    if (buildIFace)
+      tpe.push_back(StringKind(name ? name.getValue() : "_"));
+    return true;
+  }
+  case ElementInfo::Boolean: {
+    auto name = field.getAs<StringAttr>("name");
+    if (!name) {
+      llvm::errs() << "boolean element missing 'name'\n";
+      return false;
+    }
+    if (buildIFace)
+      tpe.push_back(BooleanKind(name ? name.getValue() : "_"));
+    return true;
+  }
+  case ElementInfo::Integer: {
+    auto name = field.getAs<StringAttr>("name");
+    if (!name) {
+      llvm::errs() << "integer element missing 'name'\n";
+      return false;
+    }
+    if (buildIFace)
+      tpe.push_back(IntegerKind(name ? name.getValue() : "_"));
+    return true;
+  }
+  case ElementInfo::Double: {
+    auto name = field.getAs<StringAttr>("name");
+    if (!name) {
+      llvm::errs() << "double element missing 'name'\n";
+      return false;
+    }
+    if (buildIFace)
+      tpe.push_back(DoubleKind(name ? name.getValue() : "_"));
+    return true;
+  }
+  case ElementInfo::Error: {
+    llvm::errs() << "unknown field class name '" << clazz.getValue() << "'\n";
     return false;
-  default:
-    break;
+  }
   }
 
-  // Compute the instantiation name which is "defName" for BundleType and "name"
-  // for anything else.
+  // Compute the instantiation name which is "defName" for BundleType and
+  // "name" for anything else.
   auto name = field.getAs<StringAttr>("name");
   if (!name)
     name = field.getAs<StringAttr>("defName");
-  if (!name)
+  if (!name) {
+    llvm::errs() << "missing 'name' in field: " << field << "\n";
     return false;
+  }
 
   StringRef description = {};
   if (auto maybeDescription = field.getAs<StringAttr>("description"))
@@ -641,16 +495,32 @@ bool GrandCentralPass::unfoldBundle(Annotation anno, IntegerAttr id, Twine path,
 
   auto defName = anno.getMember<StringAttr>("defName");
   auto elements = anno.getMember<ArrayAttr>("elements");
-  if (!defName || !elements)
+  if (!defName || !elements) {
+    llvm::errs() << "missing 'defName' or 'elements' in " << anno.getDict()
+                 << "\n";
     return false;
+  }
   // Set the ID if it is not already set.  Only the outermost BundleType will
   // have an ID set.
   auto isRoot = false;
   if (!id) {
     isRoot = true;
     id = anno.getMember<IntegerAttr>("id");
-    if (!id)
+    if (!id) {
+      llvm::errs() << "missing 'id' in root-level BundleType: "
+                   << anno.getDict() << "\n";
       return false;
+    }
+    if (parentIDMap.count(id) == 0) {
+      llvm::errs() << "no parent found with 'id' value '"
+                   << id.getValue().getZExtValue() << "'\n";
+      return false;
+    }
+    if (companionIDMap.count(id) == 0) {
+      llvm::errs() << "no companion found with 'id' value '"
+                   << id.getValue().getZExtValue() << "'\n";
+      return false;
+    }
   }
 
   auto loc = getOperation().getLoc();
@@ -702,14 +572,20 @@ bool GrandCentralPass::unfoldBundle(Annotation anno, IntegerAttr id, Twine path,
 
   for (auto element : elements) {
     auto field = element.dyn_cast_or_null<DictionaryAttr>();
-    if (!field)
+    if (!field) {
+      llvm::errs() << "non-dictionary element in: " << anno.getDict() << "\n";
       return false;
+    }
+
     auto clazz = field.getAs<StringAttr>("class");
-    if (!clazz)
-      return false;
     auto name = field.getAs<StringAttr>("name");
     if (!name)
+      name = field.getAs<StringAttr>("defName");
+    if (!clazz || !name) {
+      llvm::errs() << "field missing 'class' or 'name'/'defName' in: " << field
+                   << "\n";
       return false;
+    }
 
     SmallVector<Element> tpe;
     auto fields = unfoldField(element, tpe, id,
@@ -780,7 +656,31 @@ GrandCentralPass::computeType(ArrayRef<Element> elements, OpBuilder &builder) {
         })
         .Case<BundleKind>([&](auto a) {
           stringEmission = true;
-          s << a->name << " " << a->name;
+          s << a->name << " " << a->name << "()";
+        })
+        .Case<StringKind>([&](auto a) {
+          assert(elements.size() == 1);
+          stringEmission = true;
+          s << "// " << a->name << " = "
+            << "<unsupported string type>";
+        })
+        .Case<BooleanKind>([&](auto a) {
+          assert(elements.size() == 1);
+          stringEmission = true;
+          s << "// " << a->name << " = "
+            << "<unsupported boolean type>";
+        })
+        .Case<IntegerKind>([&](auto a) {
+          assert(elements.size() == 1);
+          stringEmission = true;
+          s << "// " << a->name << " = "
+            << "<unsupported integer type>";
+        })
+        .Case<DoubleKind>([&](auto a) {
+          assert(elements.size() == 1);
+          stringEmission = true;
+          s << "// " << a->name << " = "
+            << "<unsupported double type>";
         });
   }
 
@@ -801,8 +701,8 @@ void GrandCentralPass::runOnOperation() {
 
   // Utility that acts like emitOpError, but does _not_ include a note.  The
   // note in emitOpError includes the entire op which means the **ENTIRE**
-  // FIRRTL circuit.  This doesn't communicate anything useful to the user other
-  // than flooding their terminal.
+  // FIRRTL circuit.  This doesn't communicate anything useful to the user
+  // other than flooding their terminal.
   auto emitCircuitError = [&circuitOp](StringRef message = {}) {
     return emitError(circuitOp.getLoc(), message);
   };
@@ -840,8 +740,8 @@ void GrandCentralPass::runOnOperation() {
 
   // Setup the builder to create ops _inside the FIRRTL circuit_.  This is
   // necessary because interfaces and interface instances are created.
-  // Instances link to their definitions via symbols and we don't want to break
-  // this.
+  // Instances link to their definitions via symbols and we don't want to
+  // break this.
   auto builder = OpBuilder::atBlockEnd(circuitOp.getBody());
 
   SymbolTable symbolTable(circuitOp);
@@ -850,8 +750,7 @@ void GrandCentralPass::runOnOperation() {
   circuitOp.walk([&](Operation *op) {
     TypeSwitch<Operation *>(op)
         .Case<RegOp, RegResetOp, WireOp, NodeOp>([&](auto op) {
-          AnnotationSet annotations = AnnotationSet(op);
-          annotations.removeAnnotations([&](Annotation annotation) {
+          AnnotationSet::removeAnnotations(op, [&](Annotation annotation) {
             if (!annotation.isClass(
                     "sifive.enterprise.grandcentral.AugmentedGroundType"))
               return false;
@@ -870,40 +769,35 @@ void GrandCentralPass::runOnOperation() {
 
             return true;
           });
-          annotations.applyToOperation(op);
         })
         .Case<InstanceOp>([&](auto op) {
           /* Populate the leafMap for ports. */
         })
         .Case<FModuleOp>([&](FModuleOp op) {
           // Handle annotations on the ports.
-          auto ports = op.getPorts();
-          for (size_t i = 0, e = ports.size(); i != e; ++i) {
-            auto annotations = AnnotationSet::forPort(op, i);
-            annotations.removeAnnotations([&](Annotation annotation) {
-              if (!annotation.isClass(
-                      "sifive.enterprise.grandcentral.AugmentedGroundType"))
-                return false;
+          AnnotationSet::removePortAnnotations(
+              op, [&](unsigned i, Annotation annotation) {
+                if (!annotation.isClass(
+                        "sifive.enterprise.grandcentral.AugmentedGroundType"))
+                  return false;
 
-              auto id = annotation.getMember<IntegerAttr>("id");
-              if (!id) {
-                op.emitOpError()
-                    << "contained a malformed "
-                       "'sifive.enterprise.grandcentral.AugmentedGroundType' "
-                       "annotation that did not contain an 'id' field";
-                removalError = true;
-                return false;
-              }
+                auto id = annotation.getMember<IntegerAttr>("id");
+                if (!id) {
+                  op.emitOpError()
+                      << "contained a malformed "
+                         "'sifive.enterprise.grandcentral.AugmentedGroundType' "
+                         "annotation that did not contain an 'id' field";
+                  removalError = true;
+                  return false;
+                }
 
-              leafMap.insert({id, op.getArgument(i)});
+                leafMap.insert({id, op.getArgument(i)});
 
-              return true;
-            });
-          }
+                return true;
+              });
 
           // Handle annotations on the module.
-          AnnotationSet annotations = AnnotationSet(op);
-          annotations.removeAnnotations([&](Annotation annotation) {
+          AnnotationSet::removeAnnotations(op, [&](Annotation annotation) {
             if (!annotation.isClass(
                     "sifive.enterprise.grandcentral.ViewAnnotation"))
               return false;
@@ -913,21 +807,24 @@ void GrandCentralPass::runOnOperation() {
             if (!tpe) {
               op.emitOpError()
                   << "has a malformed "
-                     "'sifive.enterprise.grandcentral.ViewAnnotation' that did "
+                     "'sifive.enterprise.grandcentral.ViewAnnotation' that "
+                     "did "
                      "not contain a 'type' field with a 'StringAttr' value";
               goto FModuleOp_error;
             }
             if (!id) {
               op.emitOpError()
                   << "has a malformed "
-                     "'sifive.enterprise.grandcentral.ViewAnnotation' that did "
+                     "'sifive.enterprise.grandcentral.ViewAnnotation' that "
+                     "did "
                      "not contain an 'id' field with an 'IntegerAttr' value";
               goto FModuleOp_error;
             }
             if (!name) {
               op.emitOpError()
                   << "has a malformed "
-                     "'sifive.enterprise.grandcentral.ViewAnnotation' that did "
+                     "'sifive.enterprise.grandcentral.ViewAnnotation' that "
+                     "did "
                      "not contain a 'name' field with a 'StringAttr' value";
               goto FModuleOp_error;
             }
@@ -946,18 +843,19 @@ void GrandCentralPass::runOnOperation() {
               companionIDMap.insert({id, {name.getValue(), op, mapping}});
 
               auto instances = symbolTable.getSymbolUses(op, circuitOp);
-              if (!instances) {
-                op.emitOpError()
-                    << "is not instantiated in the design, but must be for "
-                       "Grand Central to prop";
+              if (!instances ||
+                  std::distance(instances.getValue().begin(),
+                                instances.getValue().end()) == 0) {
+                op.emitOpError() << "is marked as a GrandCentral 'companion', "
+                                    "but is never instantiated";
                 return false;
               }
 
               if (std::distance(instances.getValue().begin(),
                                 instances.getValue().end()) != 1) {
                 auto diag = op.emitOpError()
-                            << "is instantiate more than once, Grand "
-                               "Central doesn't know how to handle this";
+                            << "is marked as a GrandCentral 'companion', but "
+                               "it is instantiated more than once";
                 for (auto instance : instances.getValue())
                   diag.attachNote(instance.getUser()->getLoc())
                       << "parent is instantiated here";
@@ -966,6 +864,12 @@ void GrandCentralPass::runOnOperation() {
 
               auto instance =
                   cast<InstanceOp>((*(instances.getValue().begin())).getUser());
+
+              // Instantiate the mapping module inside the companion.
+              builder.setInsertionPointToEnd(op.getBodyBlock());
+              builder.create<InstanceOp>(circuitOp.getLoc(),
+                                         SmallVector<Type>({}),
+                                         mapping.getName(), mapping.getName());
 
               // If an extraction annotation was found then extract the
               // interface.
@@ -995,18 +899,19 @@ void GrandCentralPass::runOnOperation() {
             }
             if (tpe.getValue() == "parent") {
               auto instances = symbolTable.getSymbolUses(op, circuitOp);
-              if (!instances) {
-                op.emitOpError()
-                    << "is not instantiated in the design, but must be for "
-                       "Grand Central to prop";
+              if (!instances ||
+                  std::distance(instances.getValue().begin(),
+                                instances.getValue().end()) == 0) {
+                op.emitOpError() << "is marked as a GrandCentral 'parent', but "
+                                    "is never instantiated";
                 return false;
               }
 
               if (std::distance(instances.getValue().begin(),
                                 instances.getValue().end()) != 1) {
                 auto diag = op.emitOpError()
-                            << "is instantiate more than once, Grand "
-                               "Central doesn't know how to handle this";
+                            << "is marked as a GrandCentral 'parent', but it "
+                               "is instantiated more than once";
                 for (auto instance : instances.getValue())
                   diag.attachNote(instance.getUser()->getLoc())
                       << "parent is instantiated here";
@@ -1020,7 +925,8 @@ void GrandCentralPass::runOnOperation() {
               return true;
             }
             op.emitOpError()
-                << "has a 'sifive.enterprise.grandcentral.ViewAnnotation' with "
+                << "has a 'sifive.enterprise.grandcentral.ViewAnnotation' "
+                   "with "
                    "an unknown 'type' field";
           FModuleOp_error:
             removalError = true;
@@ -1031,6 +937,28 @@ void GrandCentralPass::runOnOperation() {
 
   if (removalError)
     return signalPassFailure();
+
+  // Check that the parent and the companion both exist.
+  for (auto a : companionIDMap) {
+    if (parentIDMap.count(a.first) == 0) {
+      emitCircuitError()
+          << "contains a 'companion' with id '"
+          << a.first.cast<IntegerAttr>().getValue().getZExtValue()
+          << "', but does not contain a GrandCentral 'parent' with the same "
+             "id";
+      return signalPassFailure();
+    }
+  }
+  for (auto a : parentIDMap) {
+    if (companionIDMap.count(a.first) == 0) {
+      emitCircuitError()
+          << "contains a 'parent' with id '"
+          << a.first.cast<IntegerAttr>().getValue().getZExtValue()
+          << "', but does not contain a GrandCentral 'companion' "
+             "with the same id";
+      return signalPassFailure();
+    }
+  }
 
   llvm::errs() << "companionIDMap:\n";
   for (auto a : companionIDMap)
@@ -1088,6 +1016,8 @@ void GrandCentralPass::runOnOperation() {
 
     return true;
   });
+
+  annotations.applyToOperation(circuitOp);
 
   // Signal pass failure if any errors were found while examining circuit
   // annotations.
