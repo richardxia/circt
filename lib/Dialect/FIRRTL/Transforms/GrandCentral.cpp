@@ -30,7 +30,16 @@ using namespace firrtl;
 //===----------------------------------------------------------------------===//
 
 struct Element {
-  enum ElementKind { Bundle, Vector, Ground, String, Boolean, Integer, Double };
+  enum ElementKind {
+    Error = -1,
+    Bundle,
+    Vector,
+    Ground,
+    String,
+    Boolean,
+    Integer,
+    Double
+  };
 
   const ElementKind kind;
 
@@ -95,144 +104,7 @@ struct DoubleKind : public Element {
   }
 };
 
-inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
-                                     const Element element) {
-  TypeSwitch<const Element *>(&element)
-      .Case<BundleKind>([&](auto a) { os << "BUNDLE -> " << a->name; })
-      .Case<VectorKind>([&](auto a) {
-        os << "VECTOR -> name: " << a->name << ", depth: " << a->getDepth();
-      })
-      .Case<GroundKind>([&](auto a) {
-        os << "GROUND -> name: " << a->name << ", width: " << a->getWidth();
-      });
-  return os;
-};
-
 namespace {
-/// Mutable store of information about an Element in an interface.  This is
-/// derived from information stored in the "elements" field of an
-/// "AugmentedBundleType".  This is updated as more information is known about
-/// an Element.
-struct ElementInfo {
-  /// Encodes the "tpe" of an element.  This is called "Kind" to avoid
-  /// overloading the meaning of "Type" (which also conflicts with mlir::Type).
-  enum Kind {
-    Error = -1,
-    Ground,
-    Vector,
-    Bundle,
-    String,
-    Boolean,
-    Integer,
-    Double
-  };
-  /// The "tpe" field indicating if this element of the interface is a ground
-  /// type, a vector type, or a bundle type.  Bundle types are nested
-  /// interfaces.
-  Kind tpe;
-  /// A string description that will show up as a comment in the output Verilog.
-  StringRef description;
-  /// The width of this interface.  This is only non-negative for ground or
-  /// vector types.
-  int32_t width = -1;
-  /// The depth of the interface.  This is one for ground types and greater
-  /// than one for vector types.
-  uint32_t depth = 0;
-  /// Indicate if this element was found in the circuit.
-  bool found = false;
-  /// Trakcs location information about what was used to build this element.
-  SmallVector<Location> locations = {};
-  /// The FIRRTL operation that this is supposed to be connected to.  This is
-  /// null if no operation was found or has yet been found.
-  Operation *op = {};
-  /// True if this is a ground or vector type and it was not (statefully) found.
-  /// This indicates that an interface element, which is composed of ground and
-  /// vector types, found no matching, annotated components in the circuit.
-  bool isMissing() { return !found && (tpe == Ground || tpe == Vector); }
-};
-
-/// Stores a decoded Grand Central AugmentedField
-struct AugmentedField {
-  /// The name of the field.
-  StringRef name;
-  /// An optional descripton that the user provided for the field.  This should
-  /// become a comment in the Verilog.
-  StringRef description;
-  /// The "type" of the field.
-  ElementInfo::Kind tpe;
-  /// An optional global identifier.
-  IntegerAttr id;
-};
-
-/// Stores a decoded Grand Central AugmentedBundleType.
-struct AugmentedBundleType {
-  /// The name of the interface.
-  StringRef defName;
-  /// The elements that make up the body of the interface.
-  SmallVector<AugmentedField> elements;
-  /// An optional global identifier.
-  IntegerAttr id;
-};
-
-inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
-                                     const ElementInfo::Kind tpe) {
-  switch (tpe) {
-  case ElementInfo::Error:
-    os << "error";
-    break;
-  case ElementInfo::Ground:
-    os << "ground";
-    break;
-  case ElementInfo::Vector:
-    os << "vector";
-    break;
-  case ElementInfo::Bundle:
-    os << "bundle";
-    break;
-  case ElementInfo::String:
-    os << "string";
-    break;
-  case ElementInfo::Boolean:
-    os << "boolean";
-    break;
-  case ElementInfo::Integer:
-    os << "integer";
-    break;
-  case ElementInfo::Double:
-    os << "double";
-    break;
-  }
-  return os;
-};
-
-inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
-                                     const AugmentedBundleType iface) {
-  os << "iface:\n"
-     << "  defName: " << iface.defName << "\n"
-     << "  id: " << iface.id << "\n"
-     << "  elements:\n";
-  for (size_t i = 0, e = iface.elements.size(); i != e; i++) {
-    auto element = iface.elements[i];
-    os << "    - name: " << element.name << "\n"
-       << "      id: " << element.id << "\n"
-       << "      description: " << element.description << "\n"
-       << "      tpe: " << element.tpe;
-    if (i < e - 1)
-      os << "\n";
-  }
-  return os;
-};
-
-// enum IDKind { Parent, Companion, Element };
-
-// using llvm::PointerSumType;
-// using llvm::PointerSumTypeMember;
-
-// typedef PointerSumType<IDKind, PointerSumTypeMember<Parent, Operation *>,
-//                        PointerSumTypeMember<Companion, Operation *>,
-//                        PointerSumTypeMember<Element, Operation *>>
-//     IDSum;
-
 /// Stores the information content of an ExtractGrandCentralAnnotation.
 struct ExtractionInfo {
   /// The directority where Grand Central generated collateral (modules,
@@ -278,11 +150,6 @@ struct CompanionInfo {
 struct GrandCentralPass : public GrandCentralBase<GrandCentralPass> {
   void runOnOperation() override;
 
-  // A map storing mutable information about an element in an interface.  This
-  // is keyed using a (defName, name) tuple where defname is the name of the
-  // interface and name is the name of the element.
-  typedef DenseMap<std::pair<StringRef, StringRef>, ElementInfo> InterfaceMap;
-
 private:
   // Mapping of ID to leaf graound type associated with that ID.
   llvm::DenseMap<Attribute, Value> leafMap;
@@ -299,10 +166,10 @@ private:
   bool unfoldBundle(Annotation anno, IntegerAttr id = {}, Twine path = {},
                     bool buildIFace = false);
 
-  FModuleOp getEnclosingModule(Value value);
+  void buildInterfaceSignal(ArrayRef<Element> elements, OpBuilder &builder,
+                            StringRef name, StringAttr description);
 
-  std::variant<std::string, Type> computeType(ArrayRef<Element> elements,
-                                              OpBuilder &builder);
+  FModuleOp getEnclosingModule(Value value);
 
   // Inforamtion about how the circuit should be extracted.  This will be
   // non-empty if an extraction annotation is found.
@@ -331,34 +198,35 @@ bool GrandCentralPass::unfoldField(Attribute maybeField,
     llvm::errs() << "missing 'class' in field: " << field << "\n";
     return false;
   }
-  switch (llvm::StringSwitch<ElementInfo::Kind>(clazz.getValue())
+
+  auto name = field.getAs<StringAttr>("name");
+  auto defName = field.getAs<StringAttr>("defName");
+  switch (llvm::StringSwitch<Element::ElementKind>(clazz.getValue())
               .Case("sifive.enterprise.grandcentral.AugmentedBundleType",
-                    ElementInfo::Bundle)
+                    Element::Bundle)
               .Case("sifive.enterprise.grandcentral.AugmentedVectorType",
-                    ElementInfo::Vector)
+                    Element::Vector)
               .Case("sifive.enterprise.grandcentral.AugmentedGroundType",
-                    ElementInfo::Ground)
+                    Element::Ground)
               .Case("sifive.enterprise.grandcentral.AugmentedStringType",
-                    ElementInfo::String)
+                    Element::String)
               .Case("sifive.enterprise.grandcentral.AugmentedBooleanType",
-                    ElementInfo::Boolean)
+                    Element::Boolean)
               .Case("sifive.enterprise.grandcentral.AugmentedIntegerType",
-                    ElementInfo::Integer)
+                    Element::Integer)
               .Case("sifive.enterprise.grandcentral.AugmentedDoubleType",
-                    ElementInfo::Double)
-              .Default(ElementInfo::Error)) {
-  case ElementInfo::Bundle: {
-    auto name = field.getAs<StringAttr>("defName");
-    if (!name) {
+                    Element::Double)
+              .Default(Element::Error)) {
+  case Element::Bundle: {
+    if (!defName) {
       llvm::errs() << "missing 'defName' in BundleType: " << field << "\n";
       return false;
     }
     if (buildIFace)
-      tpe.push_back(std::move(BundleKind(name.getValue())));
+      tpe.push_back(std::move(BundleKind(defName.getValue())));
     return unfoldBundle(Annotation(field), id, path, buildIFace);
   }
-  case ElementInfo::Vector: {
-    auto name = field.getAs<StringAttr>("name");
+  case Element::Vector: {
     auto elements = field.getAs<ArrayAttr>("elements");
     if (!name || !elements) {
       llvm::errs() << "missing 'name' or 'elements' in VectorType: " << field
@@ -376,7 +244,7 @@ bool GrandCentralPass::unfoldField(Attribute maybeField,
     }
     return notFailed;
   }
-  case ElementInfo::Ground: {
+  case Element::Ground: {
     auto groundID = field.getAs<IntegerAttr>("id");
     auto leafValue = leafMap.lookup(groundID);
     if (!groundID || !leafValue) {
@@ -395,96 +263,69 @@ bool GrandCentralPass::unfoldField(Attribute maybeField,
     SmallString<0> srcRef;
     for (auto path : srcPaths[0])
       srcRef.append((path.name() + ".").str());
-    // srcRef.append(parentIDMap.lookup(id).first.name());
 
+    auto uloc = builder.getUnknownLoc();
     if (auto blockArg = leafValue.dyn_cast<BlockArgument>()) {
       FModuleOp module = cast<FModuleOp>(blockArg.getOwner()->getParentOp());
       builder.create<sv::VerbatimOp>(
-          getOperation().getLoc(),
-          "assign " + path + " = " + srcRef +
-              module.portNames()[blockArg.getArgNumber()]
-                  .cast<StringAttr>()
-                  .getValue() +
-              ";");
+          uloc, "assign " + path + " = " + srcRef +
+                    module.portNames()[blockArg.getArgNumber()]
+                        .cast<StringAttr>()
+                        .getValue() +
+                    ";");
     } else
-      builder.create<sv::VerbatimOp>(getOperation().getLoc(),
-                                     "assign " + path + " = " + srcRef +
-                                         leafValue.getDefiningOp()
-                                             ->getAttr("name")
-                                             .cast<StringAttr>()
-                                             .getValue() +
-                                         ";");
+      builder.create<sv::VerbatimOp>(uloc, "assign " + path + " = " + srcRef +
+                                               leafValue.getDefiningOp()
+                                                   ->getAttr("name")
+                                                   .cast<StringAttr>()
+                                                   .getValue() +
+                                               ";");
 
     auto width = leafValue.getType().cast<FIRRTLType>().getBitWidthOrSentinel();
     // The name will exist if this is a ground type or a ground type of a bundle
     // type.  There is expected to be no name if this is a ground type of a
     // vector type.
-    auto name = field.getAs<StringAttr>("name");
     if (buildIFace)
-      tpe.push_back(GroundKind(name ? name.getValue() : "_", width));
+      tpe.push_back(GroundKind(name ? name.getValue() : "", width));
     return true;
   }
-  case ElementInfo::String: {
-    auto name = field.getAs<StringAttr>("name");
+  case Element::String: {
     if (!name) {
       llvm::errs() << "string element missing 'name'\n";
       return false;
     }
-    if (buildIFace)
-      tpe.push_back(StringKind(name ? name.getValue() : "_"));
+    tpe.push_back(StringKind(name.getValue()));
     return true;
   }
-  case ElementInfo::Boolean: {
-    auto name = field.getAs<StringAttr>("name");
+  case Element::Boolean: {
     if (!name) {
       llvm::errs() << "boolean element missing 'name'\n";
       return false;
     }
-    if (buildIFace)
-      tpe.push_back(BooleanKind(name ? name.getValue() : "_"));
+    tpe.push_back(BooleanKind(name.getValue()));
     return true;
   }
-  case ElementInfo::Integer: {
-    auto name = field.getAs<StringAttr>("name");
+  case Element::Integer: {
     if (!name) {
       llvm::errs() << "integer element missing 'name'\n";
       return false;
     }
-    if (buildIFace)
-      tpe.push_back(IntegerKind(name ? name.getValue() : "_"));
+    tpe.push_back(IntegerKind(name.getValue()));
     return true;
   }
-  case ElementInfo::Double: {
-    auto name = field.getAs<StringAttr>("name");
+  case Element::Double: {
     if (!name) {
       llvm::errs() << "double element missing 'name'\n";
       return false;
     }
-    if (buildIFace)
-      tpe.push_back(DoubleKind(name ? name.getValue() : "_"));
+    tpe.push_back(DoubleKind(name.getValue()));
     return true;
   }
-  case ElementInfo::Error: {
+  case Element::Error: {
     llvm::errs() << "unknown field class name '" << clazz.getValue() << "'\n";
     return false;
   }
   }
-
-  // Compute the instantiation name which is "defName" for BundleType and
-  // "name" for anything else.
-  auto name = field.getAs<StringAttr>("name");
-  if (!name)
-    name = field.getAs<StringAttr>("defName");
-  if (!name) {
-    llvm::errs() << "missing 'name' in field: " << field << "\n";
-    return false;
-  }
-
-  StringRef description = {};
-  if (auto maybeDescription = field.getAs<StringAttr>("description"))
-    description = maybeDescription.getValue();
-
-  return true;
 }
 
 /// Unfold an annotation containing an AugmentedBundleType into a sequence of
@@ -588,38 +429,92 @@ bool GrandCentralPass::unfoldBundle(Annotation anno, IntegerAttr id, Twine path,
     }
 
     SmallVector<Element> tpe;
-    auto fields = unfoldField(element, tpe, id,
-                              path.isTriviallyEmpty()
-                                  ? defName.getValue() + "." + name.getValue()
-                                  : path + "." + name.getValue(),
-                              buildIFace);
-    if (!fields)
+    if (!unfoldField(element, tpe, id,
+                     path.isTriviallyEmpty()
+                         ? defName.getValue() + "." + name.getValue()
+                         : path + "." + name.getValue(),
+                     buildIFace))
       return false;
 
-    std::vector<Element> bar;
-    for (auto a : tpe)
-      bar.push_back(a);
-
-    if (buildIFace) {
-      auto description = field.getAs<StringAttr>("description");
-      if (description)
-        builder.create<sv::VerbatimOp>(loc,
-                                       ("// " + description.getValue()).str());
-
-      std::variant<std::string, Type> foo = computeType(bar, builder);
-
-      if (std::holds_alternative<std::string>(foo))
-        builder.create<sv::VerbatimOp>(loc, std::get<0>(foo));
-      else
-        builder.create<sv::InterfaceSignalOp>(
-            getOperation().getLoc(), name.getValue(), std::get<1>(foo));
-    }
+    if (buildIFace)
+      buildInterfaceSignal(tpe, builder, name.getValue(),
+                           field.getAs<StringAttr>("description"));
   }
 
   if (buildIFace)
     llvm::errs() << *iface << "\n";
 
   return true;
+}
+
+void GrandCentralPass::buildInterfaceSignal(ArrayRef<Element> elements,
+                                            OpBuilder &builder, StringRef name,
+                                            StringAttr description) {
+
+  // This is walking a sequency of element types to build up a representation of
+  // an interface signal.  This is either an actual interface signal type or a
+  // string representing something that is another interface.  This is using a
+  // string for a nested interface due to existing limitations around doing this
+  // in the SV dialect (see: https://github.com/llvm/circt/issues/1171).
+  std::string str;
+  llvm::raw_string_ostream s(str);
+  Type tpe;
+  bool isIface = false;
+  for (auto element : llvm::reverse(elements)) {
+    TypeSwitch<Element *>(&element)
+        .Case<GroundKind>(
+            [&](auto a) { tpe = builder.getIntegerType(a->getWidth()); })
+        .Case<VectorKind>([&](auto a) {
+          if (!str.empty()) {
+            s << "[" << a->getDepth() << "]";
+            return;
+          }
+          tpe = hw::UnpackedArrayType::get(tpe, a->getDepth());
+        })
+        .Case<BundleKind>([&](auto a) {
+          isIface = true;
+          s << a->name << " " << a->name;
+        })
+        .Case<StringKind>([&](auto a) {
+          assert(elements.size() == 1);
+          s << "// " << a->name << " = "
+            << "<unsupported string type>";
+        })
+        .Case<BooleanKind>([&](auto a) {
+          assert(elements.size() == 1);
+          s << "// " << a->name << " = "
+            << "<unsupported boolean type>";
+        })
+        .Case<IntegerKind>([&](auto a) {
+          assert(elements.size() == 1);
+          s << "// " << a->name << " = "
+            << "<unsupported integer type>";
+        })
+        .Case<DoubleKind>([&](auto a) {
+          assert(elements.size() == 1);
+          s << "// " << a->name << " = "
+            << "<unsupported double type>";
+        });
+  }
+
+  // If this is an interface, then add a "()" at the end.  This is enabling
+  // vectors of interfaces which have to be constructed like:
+  //
+  //     foo[2][4][8]()
+  if (isIface)
+    s << "()";
+
+  // Construct the type, included an optional description.
+  auto uloc = builder.getUnknownLoc();
+  if (description)
+    builder.create<sv::VerbatimOp>(uloc,
+                                   ("// " + description.getValue()).str());
+  if (!str.empty()) {
+    s << ";";
+    builder.create<sv::VerbatimOp>(uloc, str);
+    return;
+  }
+  builder.create<sv::InterfaceSignalOp>(getOperation().getLoc(), name, tpe);
 }
 
 FModuleOp GrandCentralPass::getEnclosingModule(Value value) {
@@ -631,65 +526,6 @@ FModuleOp GrandCentralPass::getEnclosingModule(Value value) {
     return cast<FModuleOp>(instance.getReferencedModule());
 
   return op->getParentOfType<FModuleOp>();
-}
-
-std::variant<std::string, Type>
-GrandCentralPass::computeType(ArrayRef<Element> elements, OpBuilder &builder) {
-
-  bool stringEmission = false;
-  std::string str = "";
-  llvm::raw_string_ostream s(str);
-  Type tpe;
-  for (auto element : llvm::reverse(elements)) {
-    TypeSwitch<Element *>(&element)
-        .Case<GroundKind>([&](auto a) {
-          tpe = builder.getIntegerType(a->getWidth());
-          return;
-        })
-        .Case<VectorKind>([&](auto a) {
-          if (stringEmission) {
-            s << "[" << a->getDepth() << "]";
-            return;
-          }
-          tpe = hw::UnpackedArrayType::get(tpe, a->getDepth());
-          return;
-        })
-        .Case<BundleKind>([&](auto a) {
-          stringEmission = true;
-          s << a->name << " " << a->name << "()";
-        })
-        .Case<StringKind>([&](auto a) {
-          assert(elements.size() == 1);
-          stringEmission = true;
-          s << "// " << a->name << " = "
-            << "<unsupported string type>";
-        })
-        .Case<BooleanKind>([&](auto a) {
-          assert(elements.size() == 1);
-          stringEmission = true;
-          s << "// " << a->name << " = "
-            << "<unsupported boolean type>";
-        })
-        .Case<IntegerKind>([&](auto a) {
-          assert(elements.size() == 1);
-          stringEmission = true;
-          s << "// " << a->name << " = "
-            << "<unsupported integer type>";
-        })
-        .Case<DoubleKind>([&](auto a) {
-          assert(elements.size() == 1);
-          stringEmission = true;
-          s << "// " << a->name << " = "
-            << "<unsupported double type>";
-        });
-  }
-
-  if (stringEmission) {
-    s << ";";
-    return str;
-  }
-
-  return tpe;
 }
 
 void GrandCentralPass::runOnOperation() {
@@ -1001,7 +837,6 @@ void GrandCentralPass::runOnOperation() {
     if (!anno.isClass("sifive.enterprise.grandcentral.AugmentedBundleType"))
       return false;
 
-    AugmentedBundleType bundle;
     auto id = anno.getMember<IntegerAttr>("id");
     if (!unfoldBundle(anno, {}, companionIDMap.lookup(id).name, true)) {
       emitCircuitError(
@@ -1017,12 +852,12 @@ void GrandCentralPass::runOnOperation() {
     return true;
   });
 
-  annotations.applyToOperation(circuitOp);
-
   // Signal pass failure if any errors were found while examining circuit
   // annotations.
   if (removalError)
     return signalPassFailure();
+
+  annotations.applyToOperation(circuitOp);
 }
 
 //===----------------------------------------------------------------------===//
