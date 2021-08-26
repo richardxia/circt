@@ -6,9 +6,33 @@ firrtl.circuit "NoExtractGrandCentralAnnotation" attributes {
     {class = "sifive.enterprise.grandcentral.AugmentedBundleType",
      defName = "Foo",
      elements = [
-       {name = "foo",
-        tpe = "sifive.enterprise.grandcentral.AugmentedGroundType"}]}] } {
-  firrtl.module @NoExtractGrandCentralAnnotation() {}
+       {class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+        id = 1 : i64,
+        name = "foo"}],
+     id = 0 : i64}] } {
+  firrtl.module @Companion() attributes {
+    annotations = [
+      {class = "sifive.enterprise.grandcentral.ViewAnnotation",
+       defName = "Foo",
+       id = 0 : i64,
+       name = "View",
+       type = "companion"}]} {}
+  firrtl.module @DUT() attributes {
+    annotations = [
+      {class = "sifive.enterprise.grandcentral.ViewAnnotation",
+       id = 0 : i64,
+       name = "view",
+       type = "parent"}
+    ]} {
+    %a = firrtl.wire {annotations = [
+      {a},
+      {class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+       id = 1 : i64}]} : !firrtl.uint<1>
+      firrtl.instance @Companion {name = "companion"}
+    }
+  firrtl.module @NoExtractGrandCentralAnnotation() {
+    firrtl.instance @DUT {name = "dut"}
+  }
 }
 
 // -----
