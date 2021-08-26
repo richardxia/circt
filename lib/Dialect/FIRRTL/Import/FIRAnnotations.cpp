@@ -672,7 +672,7 @@ static Optional<DictionaryAttr> parseAugmentedType(
     for (auto elt : elementsAttr) {
       auto eltAttr = parseAugmentedType(
           context, elt.cast<DictionaryAttr>(), root, newAnnotations, companion,
-          name, StringAttr::get(context, ""), id, defName, loc, annotationID,
+          name, StringAttr::get(context, ""), id, None, loc, annotationID,
           clazz, path);
       if (!eltAttr)
         return None;
