@@ -105,6 +105,74 @@ struct DoubleKind : public Element {
 };
 
 namespace {
+
+/// The data content of an AugmentedBundleType.
+struct BundleType {
+  StringAttr defName;
+  ArrayAttr elements;
+  IntegerAttr id;
+
+  /// Optionally construct a BundleType from an Annotation, returning None if
+  /// the Annotation doesn't match the expected format.
+  static Optional<BundleType> fromAnno(Annotation annotation) {
+    auto defName = annotation.getMember<StringAttr>("defName");
+    auto elements = annotation.getMember<ArrayAttr>("elements");
+    bool failed = false;
+    if (!defName) {
+      llvm::errs() << "invalid 'AugmentedBundleType': missing 'defName' in "
+                   << annotation.getDict();
+      failed = true;
+    }
+    if (!elements) {
+      llvm::errs() << "invalid 'AugmentedBundleType': missing 'defName' in "
+                   << annotation.getDict();
+      failed = true;
+    }
+    if (failed)
+      return None;
+
+    return BundleType(
+        {defName, elements, annotation.getMember<IntegerAttr>("id")});
+  }
+
+  /// Return true if this AugmentedBundleType (a SystemVerilog interface) that
+  /// is a top-level interface.  Or: this returns false if this interface is
+  /// instantitate by another interface.  This works because only the outermost
+  /// AugmentedBundleType has an ID.  This invariant is established due to
+  /// annotations scattering logic.
+  bool isRoot() { return id != nullptr; }
+};
+
+/// The data content of an AugmentedFieldType.
+struct FieldType {
+  StringAttr clazz;
+  StringAttr name;
+  StringAttr description;
+
+  /// Optionally construct a FieldType from an Attribute, returning None if the
+  /// Attribute does not match the expected format.
+  static Optional<FieldType> fromAttr(Attribute attribute) {
+    auto dictionary = attribute.dyn_cast_or_null<DictionaryAttr>();
+    if (!dictionary) {
+      llvm::errs() << "non-dictionary attribute used to construct a FieldType: "
+                   << attribute << "\n";
+      return None;
+    }
+
+    auto clazz = dictionary.getAs<StringAttr>("class");
+    auto name = dictionary.getAs<StringAttr>("name");
+    if (!name)
+      name = dictionary.getAs<StringAttr>("defName");
+    if (!clazz || !name) {
+      llvm::errs() << "field missing 'class' or 'name'/'defName' in: "
+                   << dictionary << "\n";
+      return None;
+    }
+    return FieldType(
+        {clazz, name, dictionary.getAs<StringAttr>("description")});
+  }
+};
+
 /// Stores the information content of an ExtractGrandCentralAnnotation.
 struct ExtractionInfo {
   /// The directority where Grand Central generated collateral (modules,
@@ -160,11 +228,11 @@ private:
   // Mapping of ID to companion module.
   llvm::DenseMap<Attribute, CompanionInfo> companionIDMap;
 
-  bool unfoldField(Attribute maybeField, SmallVector<Element> &tpe,
-                   IntegerAttr id, Twine path, bool buildIFace = false);
+  bool traverseField(Attribute maybeField, SmallVector<Element> &tpe,
+                     IntegerAttr id, Twine path, bool buildIFace = false);
 
-  bool unfoldBundle(Annotation anno, IntegerAttr id = {}, Twine path = {},
-                    bool buildIFace = false);
+  bool traverseBundle(Annotation anno, IntegerAttr id = {}, Twine path = {},
+                      bool buildIFace = false);
 
   void buildInterfaceSignal(ArrayRef<Element> elements, OpBuilder &builder,
                             StringRef name, StringAttr description);
@@ -183,9 +251,9 @@ private:
 };
 } // namespace
 
-bool GrandCentralPass::unfoldField(Attribute maybeField,
-                                   SmallVector<Element> &tpe, IntegerAttr id,
-                                   Twine path, bool buildIFace) {
+bool GrandCentralPass::traverseField(Attribute maybeField,
+                                     SmallVector<Element> &tpe, IntegerAttr id,
+                                     Twine path, bool buildIFace) {
   assert(id && "id must be something inside unfoldField");
 
   auto field = maybeField.dyn_cast_or_null<DictionaryAttr>();
@@ -224,7 +292,7 @@ bool GrandCentralPass::unfoldField(Attribute maybeField,
     }
     if (buildIFace)
       tpe.push_back(std::move(BundleKind(defName.getValue())));
-    return unfoldBundle(Annotation(field), id, path, buildIFace);
+    return traverseBundle(Annotation(field), id, path, buildIFace);
   }
   case Element::Vector: {
     auto elements = field.getAs<ArrayAttr>("elements");
@@ -239,8 +307,8 @@ bool GrandCentralPass::unfoldField(Attribute maybeField,
     bool notFailed = true;
     for (size_t i = 0, e = elements.size(); i != e; ++i) {
       notFailed &=
-          unfoldField(elements[i], tpe, id, path + "[" + Twine(i) + "]",
-                      (i == 0) && buildIFace);
+          traverseField(elements[i], tpe, id, path + "[" + Twine(i) + "]",
+                        (i == 0) && buildIFace);
     }
     return notFailed;
   }
@@ -328,25 +396,36 @@ bool GrandCentralPass::unfoldField(Attribute maybeField,
   }
 }
 
-/// Unfold an annotation containing an AugmentedBundleType into a sequence of
-/// AugmentedBundleTypes that it contains.  Returns false if the input
-/// annotation was not a legal AugmentedBundleType..
-bool GrandCentralPass::unfoldBundle(Annotation anno, IntegerAttr id, Twine path,
-                                    bool buildIFace) {
+/// Traverse an Annotation that is an AugmentedBundleType.  During traversal,
+/// construct any discovered SystemVerilog interfaces.  If this is the root
+/// interface, instantiate that interface in the parent.  Recurse into fields of
+/// the AugmentedBundleType to construct nested interfaces and generate
+/// stringy-typed SystemVerilog hierarchical references to drive the interface.
+/// Returns false on any failure and true on success.
+///
+/// This is a normal tree traversal with dual effects.  This traversal will
+/// always generate the hierarchical refernces (as these are located at the
+/// leaves of the Annotation).  However, this only generates the interface if
+/// the `buildIFace` parameter is true.  This is done to prevent interface
+/// construction for every element of a vector (and instead just create one
+/// interface for the whole vector).
+bool GrandCentralPass::traverseBundle(Annotation anno, IntegerAttr id,
+                                      Twine path, bool buildIFace) {
 
-  auto defName = anno.getMember<StringAttr>("defName");
-  auto elements = anno.getMember<ArrayAttr>("elements");
-  if (!defName || !elements) {
-    llvm::errs() << "missing 'defName' or 'elements' in " << anno.getDict()
-                 << "\n";
+  BundleType bundle;
+  if (auto maybeBundle = BundleType::fromAnno(anno))
+    bundle = maybeBundle.getValue();
+  else
     return false;
-  }
-  // Set the ID if it is not already set.  Only the outermost BundleType will
-  // have an ID set.
-  auto isRoot = false;
+
+  // Set the ID if it is not already set and verify that everything is setup for
+  // further processing:
+  //   1. If the ID isn't set, then this must be the top-level BundleType.
+  //      Ensure that it is by checking that the BundleType has an ID.
+  //   2. A parent must have been found in the circuit.
+  //   3. A companion must have been found in the circuit.
   if (!id) {
-    isRoot = true;
-    id = anno.getMember<IntegerAttr>("id");
+    id = bundle.id;
     if (!id) {
       llvm::errs() << "missing 'id' in root-level BundleType: "
                    << anno.getDict() << "\n";
@@ -364,29 +443,28 @@ bool GrandCentralPass::unfoldBundle(Annotation anno, IntegerAttr id, Twine path,
     }
   }
 
-  auto loc = getOperation().getLoc();
   auto builder = OpBuilder::atBlockEnd(getOperation().getBody());
-  auto *ctx = builder.getContext();
-  Operation *iface;
   if (buildIFace) {
-    iface = builder.create<sv::InterfaceOp>(loc, defName.getValue());
+    builder.setInsertionPointToEnd(getOperation().getBody());
+    auto loc = getOperation().getLoc();
+    sv::InterfaceOp iface =
+        builder.create<sv::InterfaceOp>(loc, bundle.defName.getValue());
     iface->setAttr("output_file",
                    hw::OutputFileAttr::get(
-                       StringAttr::get(ctx, getOutputDirectory()),
-                       StringAttr::get(ctx, defName.getValue() + ".sv"),
-                       BoolAttr::get(ctx, true), BoolAttr::get(ctx, true),
-                       ctx));
+                       builder.getStringAttr(getOutputDirectory()),
+                       builder.getStringAttr(bundle.defName.getValue() + ".sv"),
+                       builder.getBoolAttr(true), builder.getBoolAttr(true),
+                       builder.getContext()));
 
     // If this is the root interface, then it needs to be instantiated in the
     // parent.
-    if (isRoot) {
+    if (bundle.isRoot()) {
       builder.setInsertionPointToEnd(
           parentIDMap.lookup(id).second.getBodyBlock());
       auto instance = builder.create<sv::InterfaceInstanceOp>(
-          loc, cast<sv::InterfaceOp>(iface).getInterfaceType(),
-          companionIDMap.lookup(id).name,
+          loc, iface.getInterfaceType(), companionIDMap.lookup(id).name,
           builder.getStringAttr("__" + companionIDMap.lookup(id).name + "_" +
-                                defName.getValue() + "__"));
+                                bundle.defName.getValue() + "__"));
 
       // If there was no bind file passed in, then we're not supposed to
       // extract this.  Delete the annotation and continue.
@@ -402,8 +480,7 @@ bool GrandCentralPass::unfoldBundle(Annotation anno, IntegerAttr id, Twine path,
             hw::OutputFileAttr::get(
                 builder.getStringAttr(""),
                 builder.getStringAttr(maybeExtractInfo.getValue().bindFilename),
-                /*exclude_from_filelist=*/builder.getBoolAttr(true),
-                /*exclude_replicated_ops=*/builder.getBoolAttr(true),
+                builder.getBoolAttr(true), builder.getBoolAttr(true),
                 bind.getContext()));
       }
     }
@@ -411,38 +488,26 @@ bool GrandCentralPass::unfoldBundle(Annotation anno, IntegerAttr id, Twine path,
     builder.setInsertionPointToEnd(cast<sv::InterfaceOp>(iface).getBodyBlock());
   }
 
-  for (auto element : elements) {
-    auto field = element.dyn_cast_or_null<DictionaryAttr>();
-    if (!field) {
-      llvm::errs() << "non-dictionary element in: " << anno.getDict() << "\n";
+  for (auto element : bundle.elements) {
+    FieldType field;
+    if (auto maybeField = FieldType::fromAttr(element))
+      field = maybeField.getValue();
+    else
       return false;
-    }
-
-    auto clazz = field.getAs<StringAttr>("class");
-    auto name = field.getAs<StringAttr>("name");
-    if (!name)
-      name = field.getAs<StringAttr>("defName");
-    if (!clazz || !name) {
-      llvm::errs() << "field missing 'class' or 'name'/'defName' in: " << field
-                   << "\n";
-      return false;
-    }
 
     SmallVector<Element> tpe;
-    if (!unfoldField(element, tpe, id,
-                     path.isTriviallyEmpty()
-                         ? defName.getValue() + "." + name.getValue()
-                         : path + "." + name.getValue(),
-                     buildIFace))
+    if (!traverseField(element, tpe, id,
+                       path.isTriviallyEmpty()
+                           ? bundle.defName.getValue() + "." +
+                                 field.name.getValue()
+                           : path + "." + field.name.getValue(),
+                       buildIFace))
       return false;
 
     if (buildIFace)
-      buildInterfaceSignal(tpe, builder, name.getValue(),
-                           field.getAs<StringAttr>("description"));
+      buildInterfaceSignal(tpe, builder, field.name.getValue(),
+                           field.description);
   }
-
-  if (buildIFace)
-    llvm::errs() << *iface << "\n";
 
   return true;
 }
@@ -473,7 +538,7 @@ void GrandCentralPass::buildInterfaceSignal(ArrayRef<Element> elements,
         })
         .Case<BundleKind>([&](auto a) {
           isIface = true;
-          s << a->name << " " << a->name;
+          s << a->name << " " << name;
         })
         .Case<StringKind>([&](auto a) {
           assert(elements.size() == 1);
@@ -500,7 +565,7 @@ void GrandCentralPass::buildInterfaceSignal(ArrayRef<Element> elements,
   // If this is an interface, then add a "()" at the end.  This is enabling
   // vectors of interfaces which have to be constructed like:
   //
-  //     foo[2][4][8]()
+  //     Foo Foo[2][4][8]()
   if (isIface)
     s << "()";
 
@@ -509,12 +574,13 @@ void GrandCentralPass::buildInterfaceSignal(ArrayRef<Element> elements,
   if (description)
     builder.create<sv::VerbatimOp>(uloc,
                                    ("// " + description.getValue()).str());
-  if (!str.empty()) {
-    s << ";";
-    builder.create<sv::VerbatimOp>(uloc, str);
+  if (str.empty()) {
+    builder.create<sv::InterfaceSignalOp>(getOperation().getLoc(), name, tpe);
     return;
   }
-  builder.create<sv::InterfaceSignalOp>(getOperation().getLoc(), name, tpe);
+
+  s << ";";
+  builder.create<sv::VerbatimOp>(uloc, str);
 }
 
 FModuleOp GrandCentralPass::getEnclosingModule(Value value) {
@@ -838,7 +904,7 @@ void GrandCentralPass::runOnOperation() {
       return false;
 
     auto id = anno.getMember<IntegerAttr>("id");
-    if (!unfoldBundle(anno, {}, companionIDMap.lookup(id).name, true)) {
+    if (!traverseBundle(anno, {}, companionIDMap.lookup(id).name, true)) {
       emitCircuitError(
           "'firrtl.circuit' op contained an 'AugmentedBundleType' "
           "Annotation which did not conform to the expected format")
