@@ -66,7 +66,7 @@ struct VectorKind : public Element {
   uint64_t getDepth() const { return storage; }
 };
 
-class GroundKind : public Element {
+struct GroundKind : public Element {
 public:
   GroundKind(StringRef name, uint64_t width)
       : Element({ElementKind::Ground, name, width}) {}
@@ -254,8 +254,6 @@ private:
 bool GrandCentralPass::traverseField(Attribute maybeField,
                                      SmallVector<Element> &tpe, IntegerAttr id,
                                      Twine path, bool buildIFace) {
-  assert(id && "id must be something inside unfoldField");
-
   auto field = maybeField.dyn_cast_or_null<DictionaryAttr>();
   if (!field) {
     llvm::errs() << "non-dictionary field: " << maybeField << "\n";
