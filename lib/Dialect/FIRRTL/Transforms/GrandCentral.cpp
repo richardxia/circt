@@ -24,10 +24,132 @@
 
 using namespace circt;
 using namespace firrtl;
+using llvm::PointerSumType;
+using llvm::PointerSumTypeMember;
 
 //===----------------------------------------------------------------------===//
 // Pass Implementation
 //===----------------------------------------------------------------------===//
+
+namespace AugmentedTypes {
+
+namespace Kind {
+enum Kind { Error, Ground, Vector, Bundle, Unsupported };
+} // namespace Kind
+
+typedef PointerSumType<
+    Kind::Kind, PointerSumTypeMember<Kind::Error, DictionaryAttr *>,
+    PointerSumTypeMember<Kind::Ground, DictionaryAttr *>,
+    PointerSumTypeMember<Kind::Vector, DictionaryAttr *>,
+    PointerSumTypeMember<Kind::Bundle, DictionaryAttr *>,
+    PointerSumTypeMember<Kind::Unsupported, DictionaryAttr *>>
+    SumType;
+
+/// Convert a DictionaryAttr to an AugmentedType.  This handles all
+/// validation logic related to checking the DictionaryAttr.  The returned
+/// type, so long as it is not Error, can be trivially converted to an
+/// AugmentedType struct.
+static SumType fromDict(DictionaryAttr *dict) {
+  auto clazz = dict->getAs<StringAttr>("class");
+  if (!clazz) {
+    llvm::errs() << "missing 'class' key in " << dict << "\n";
+    return SumType::create<Kind::Error>(dict);
+  }
+  auto classBase = clazz.getValue();
+  classBase.consume_front("sifive.enterprise.grandcentral.Augmented");
+
+  auto kind = llvm::StringSwitch<Kind::Kind>(classBase)
+                  .Case("BundleType", Kind::Bundle)
+                  .Case("VectorType", Kind::Vector)
+                  .Case("GroundType", Kind::Ground)
+                  .Case("StringType", Kind::Unsupported)
+                  .Case("BooleanType", Kind::Unsupported)
+                  .Case("IntegerType", Kind::Unsupported)
+                  .Case("DoubleType", Kind::Unsupported)
+                  .Case("LiteralType", Kind::Unsupported)
+                  .Case("DeletedType", Kind::Unsupported)
+                  .Default(Kind::Error);
+
+  switch (kind) {
+  case Kind::Bundle:
+    if (dict->getAs<StringAttr>("defName") &&
+        dict->getAs<ArrayAttr>("elements"))
+      return SumType::create<Kind::Bundle>(dict);
+    break;
+  case Kind::Vector:
+    if (dict->getAs<StringAttr>("name") && dict->getAs<ArrayAttr>("elements"))
+      return SumType::create<Kind::Vector>(dict);
+    break;
+  case Kind::Ground:
+    if (dict->getAs<IntegerAttr>("id") && dict->getAs<StringAttr>("name"))
+      return SumType::create<Kind::Ground>(dict);
+    break;
+  case Kind::Unsupported:
+    if (dict->getAs<StringAttr>("name"))
+      return SumType::create<Kind::Unsupported>(dict);
+    break;
+  case Kind::Error:
+    break;
+  }
+
+  assert(false && "wasn't able to build SumType from dict");
+  return SumType::create<Kind::Error>(dict);
+};
+
+namespace AugmentedType {
+struct Bundle {
+  IntegerAttr id;
+  StringAttr defName;
+  ArrayAttr elements;
+  DictionaryAttr *underlying;
+  static Bundle fromSumType(AugmentedTypes::SumType a) {
+    auto *dict = a.get<AugmentedTypes::Kind::Bundle>();
+    assert(dict && "input must be a Bundle type");
+    return Bundle({dict->getAs<IntegerAttr>("id"),
+                   dict->getAs<StringAttr>("defName"),
+                   dict->getAs<ArrayAttr>("elements"), dict});
+  }
+};
+
+struct Vector {
+  StringAttr name;
+  ArrayAttr elements;
+  static Vector fromSumType(AugmentedTypes::SumType a) {
+    auto *dict = a.get<AugmentedTypes::Kind::Vector>();
+    assert(dict && "input must be a Vector type");
+    return Vector(
+        {dict->getAs<StringAttr>("name"), dict->getAs<ArrayAttr>("elements")});
+  }
+};
+
+struct Ground {
+  IntegerAttr id;
+  StringAttr name;
+  static Ground fromSumType(AugmentedTypes::SumType a) {
+    auto *dict = a.get<AugmentedTypes::Kind::Ground>();
+    assert(dict && "input must be a Ground type");
+    return Ground(
+        {dict->getAs<IntegerAttr>("id"), dict->getAs<StringAttr>("name")});
+  }
+};
+
+struct Unsupported {
+  StringAttr clazz;
+  StringAttr name;
+  DictionaryAttr *underlying;
+  static Unsupported fromSumType(AugmentedTypes::SumType a) {
+    auto *dict = a.get<AugmentedTypes::Kind::Unsupported>();
+    assert(dict && "input must be an Unsupported type");
+    return Unsupported({dict->getAs<StringAttr>("class"),
+                        dict->getAs<StringAttr>("name"), dict});
+  }
+};
+
+} // namespace AugmentedType
+
+} // namespace AugmentedTypes
+
+namespace {
 
 struct Element {
   enum ElementKind {
@@ -104,7 +226,30 @@ struct DoubleKind : public Element {
   }
 };
 
-namespace {
+struct AugmentedType {
+  enum Kind {
+    Error = -1,
+    String,
+    Integer,
+    Double,
+    Boolean,
+    Literal,
+    Deleted,
+    Ground,
+    Vector,
+    Bundle
+  };
+  Kind kind;
+  Kind getKind() const { return kind; }
+
+  // Construct an optional AugmentedType concrete struct from an arbitrary
+  // Attribute.  This does all checking of the Attribute to guarantee that the
+  // returned AugmentedType is valid.
+  static Optional<AugmentedType> fromAttr(Attribute attribute);
+  static Optional<AugmentedType> fromAnno(Annotation annotation) {
+    return fromAttr(annotation.getDict());
+  }
+};
 
 /// The data content of an AugmentedBundleType.
 struct BundleType {
@@ -148,6 +293,10 @@ struct FieldType {
   StringAttr clazz;
   StringAttr name;
   StringAttr description;
+  ArrayAttr elements;
+  IntegerAttr id;
+
+  DictionaryAttr original;
 
   /// Optionally construct a FieldType from an Attribute, returning None if the
   /// Attribute does not match the expected format.
@@ -168,8 +317,9 @@ struct FieldType {
                    << dictionary << "\n";
       return None;
     }
-    return FieldType(
-        {clazz, name, dictionary.getAs<StringAttr>("description")});
+    return FieldType({clazz, name, dictionary.getAs<StringAttr>("description"),
+                      dictionary.getAs<ArrayAttr>("elements"),
+                      dictionary.getAs<IntegerAttr>("id"), dictionary});
   }
 };
 
@@ -228,7 +378,7 @@ private:
   // Mapping of ID to companion module.
   llvm::DenseMap<Attribute, CompanionInfo> companionIDMap;
 
-  bool traverseField(Attribute maybeField, SmallVector<Element> &tpe,
+  bool traverseField(AugmentedTypes::SumType field, SmallVector<Element> &tpe,
                      IntegerAttr id, Twine path, bool buildIFace = false);
 
   bool traverseBundle(Annotation anno, IntegerAttr id = {}, Twine path = {},
@@ -251,70 +401,17 @@ private:
 };
 } // namespace
 
-bool GrandCentralPass::traverseField(Attribute maybeField,
+bool GrandCentralPass::traverseField(AugmentedTypes::SumType field,
                                      SmallVector<Element> &tpe, IntegerAttr id,
                                      Twine path, bool buildIFace) {
-  auto field = maybeField.dyn_cast_or_null<DictionaryAttr>();
-  if (!field) {
-    llvm::errs() << "non-dictionary field: " << maybeField << "\n";
-    return false;
-  }
-  auto clazz = field.getAs<StringAttr>("class");
-  if (!clazz) {
-    llvm::errs() << "missing 'class' in field: " << field << "\n";
-    return false;
-  }
+  switch (field.getTag()) {
+  case AugmentedTypes::Kind::Ground: {
+    auto ground = AugmentedTypes::AugmentedType::Ground::fromSumType(field);
 
-  auto name = field.getAs<StringAttr>("name");
-  auto defName = field.getAs<StringAttr>("defName");
-  switch (llvm::StringSwitch<Element::ElementKind>(clazz.getValue())
-              .Case("sifive.enterprise.grandcentral.AugmentedBundleType",
-                    Element::Bundle)
-              .Case("sifive.enterprise.grandcentral.AugmentedVectorType",
-                    Element::Vector)
-              .Case("sifive.enterprise.grandcentral.AugmentedGroundType",
-                    Element::Ground)
-              .Case("sifive.enterprise.grandcentral.AugmentedStringType",
-                    Element::String)
-              .Case("sifive.enterprise.grandcentral.AugmentedBooleanType",
-                    Element::Boolean)
-              .Case("sifive.enterprise.grandcentral.AugmentedIntegerType",
-                    Element::Integer)
-              .Case("sifive.enterprise.grandcentral.AugmentedDoubleType",
-                    Element::Double)
-              .Default(Element::Error)) {
-  case Element::Bundle: {
-    if (!defName) {
-      llvm::errs() << "missing 'defName' in BundleType: " << field << "\n";
-      return false;
-    }
-    if (buildIFace)
-      tpe.push_back(std::move(BundleKind(defName.getValue())));
-    return traverseBundle(Annotation(field), id, path, buildIFace);
-  }
-  case Element::Vector: {
-    auto elements = field.getAs<ArrayAttr>("elements");
-    if (!name || !elements) {
-      llvm::errs() << "missing 'name' or 'elements' in VectorType: " << field
-                   << "\n";
-      return false;
-    }
-    if (buildIFace)
-      tpe.push_back(
-          std::move(VectorKind(name.getValue(), elements.getValue().size())));
-    bool notFailed = true;
-    for (size_t i = 0, e = elements.size(); i != e; ++i) {
-      notFailed &=
-          traverseField(elements[i], tpe, id, path + "[" + Twine(i) + "]",
-                        (i == 0) && buildIFace);
-    }
-    return notFailed;
-  }
-  case Element::Ground: {
-    auto groundID = field.getAs<IntegerAttr>("id");
-    auto leafValue = leafMap.lookup(groundID);
-    if (!groundID || !leafValue) {
-      llvm::errs() << "missing 'id' or 'leafValue' in GroundType: " << field
+    // TODO: move this into the sumtype verification.
+    auto leafValue = leafMap.lookup(ground.id);
+    if (!leafValue) {
+      llvm::errs() << "missing 'leafValue' for GroundType with id " << ground.id
                    << "\n";
       return false;
     }
@@ -352,45 +449,57 @@ bool GrandCentralPass::traverseField(Attribute maybeField,
     // type.  There is expected to be no name if this is a ground type of a
     // vector type.
     if (buildIFace)
-      tpe.push_back(GroundKind(name ? name.getValue() : "", width));
+      tpe.push_back(
+          GroundKind(ground.name ? ground.name.getValue() : "", width));
     return true;
   }
-  case Element::String: {
-    if (!name) {
-      llvm::errs() << "string element missing 'name'\n";
-      return false;
+  case AugmentedTypes::Kind::Vector: {
+    auto vector = AugmentedTypes::AugmentedType::Vector::fromSumType(field);
+    if (buildIFace)
+      tpe.push_back(std::move(VectorKind(vector.name.getValue(),
+                                         vector.elements.getValue().size())));
+    bool notFailed = true;
+    for (size_t i = 0, e = vector.elements.size(); i != e; ++i) {
+      auto dict = vector.elements[i].dyn_cast<DictionaryAttr>();
+      if (!dict)
+        return false;
+      auto sumType = AugmentedTypes::fromDict(&dict);
+      notFailed &= traverseField(sumType, tpe, id, path + "[" + Twine(i) + "]",
+                                 (i == 0) && buildIFace);
     }
-    tpe.push_back(StringKind(name.getValue()));
-    return true;
+    return notFailed;
   }
-  case Element::Boolean: {
-    if (!name) {
-      llvm::errs() << "boolean element missing 'name'\n";
-      return false;
+  case AugmentedTypes::Kind::Bundle: {
+    auto bundle = AugmentedTypes::AugmentedType::Bundle::fromSumType(field);
+    if (buildIFace)
+      tpe.push_back(std::move(BundleKind(bundle.defName.getValue())));
+    return traverseBundle(Annotation(*bundle.underlying), id, path, buildIFace);
+  }
+  case AugmentedTypes::Kind::Unsupported: {
+    auto unsupported =
+        AugmentedTypes::AugmentedType::Unsupported::fromSumType(field);
+    auto classBase = unsupported.clazz.getValue();
+    classBase.consume_front("sifive.enterprise.grandcentral.Augmented");
+    if (classBase == "StringType") {
+      tpe.push_back(StringKind(unsupported.name.getValue()));
+      return true;
     }
-    tpe.push_back(BooleanKind(name.getValue()));
-    return true;
-  }
-  case Element::Integer: {
-    if (!name) {
-      llvm::errs() << "integer element missing 'name'\n";
-      return false;
+    if (classBase == "BooleanType") {
+      tpe.push_back(BooleanKind(unsupported.name.getValue()));
+      return true;
     }
-    tpe.push_back(IntegerKind(name.getValue()));
-    return true;
-  }
-  case Element::Double: {
-    if (!name) {
-      llvm::errs() << "double element missing 'name'\n";
-      return false;
+    if (classBase == "IntegerType") {
+      tpe.push_back(IntegerKind(unsupported.name.getValue()));
+      return true;
     }
-    tpe.push_back(DoubleKind(name.getValue()));
-    return true;
+    if (classBase == "DoubleType") {
+      tpe.push_back(DoubleKind(unsupported.name.getValue()));
+      return true;
+    }
+    LLVM_FALLTHROUGH;
   }
-  case Element::Error: {
-    llvm::errs() << "unknown field class name '" << clazz.getValue() << "'\n";
-    return false;
-  }
+  default:
+    assert(false && "unhandled");
   }
 }
 
@@ -487,24 +596,25 @@ bool GrandCentralPass::traverseBundle(Annotation anno, IntegerAttr id,
   }
 
   for (auto element : bundle.elements) {
-    FieldType field;
-    if (auto maybeField = FieldType::fromAttr(element))
-      field = maybeField.getValue();
-    else
+    DictionaryAttr field = element.dyn_cast<DictionaryAttr>();
+    if (!field)
       return false;
+    auto sumType = AugmentedTypes::fromDict(&field);
 
+    auto name = field.getAs<StringAttr>("name");
+    if (!name)
+      name = field.getAs<StringAttr>("defName");
+    auto description = field.getAs<StringAttr>("description");
     SmallVector<Element> tpe;
-    if (!traverseField(element, tpe, id,
+    if (!traverseField(sumType, tpe, id,
                        path.isTriviallyEmpty()
-                           ? bundle.defName.getValue() + "." +
-                                 field.name.getValue()
-                           : path + "." + field.name.getValue(),
+                           ? bundle.defName.getValue() + "." + name.getValue()
+                           : path + "." + name.getValue(),
                        buildIFace))
       return false;
 
     if (buildIFace)
-      buildInterfaceSignal(tpe, builder, field.name.getValue(),
-                           field.description);
+      buildInterfaceSignal(tpe, builder, name.getValue(), description);
   }
 
   return true;
