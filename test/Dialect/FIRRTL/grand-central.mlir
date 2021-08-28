@@ -344,7 +344,7 @@ firrtl.circuit "InterfacePort" attributes {
 
 // The Grand Central annotations are removed.
 // CHECK: firrtl.module @DUT
-// CHECK-SAME{LITERAL}: portAnnotations = [[{a}]]
+// CHECK-SAME: %a: !firrtl.uint<4> {firrtl.annotations = [{a}]}
 
 // CHECK: sv.interface {
 // CHECK-SAME: output_file = {directory = "gct-dir"
