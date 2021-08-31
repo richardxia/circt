@@ -839,6 +839,7 @@ void GrandCentralPass::runOnOperation() {
               goto FModuleOp_error;
             }
             if (tpe.getValue() == "companion") {
+              builder.setInsertionPointToEnd(circuitOp.getBody());
               auto mapping = builder.create<FModuleOp>(
                   circuitOp.getLoc(),
                   builder.getStringAttr(name.getValue() + "_mapping"),
