@@ -151,6 +151,41 @@ struct Unsupported {
 
 namespace {
 
+struct CircuitNamespace {
+
+private:
+  llvm::StringSet<> internal;
+  CircuitNamespace(llvm::StringSet<> internal) : internal(internal) {}
+
+public:
+  CircuitNamespace(CircuitOp op) {
+    op.walk([&](Operation *op) {
+      if (auto symbol = op->getAttrOfType<StringAttr>("sym_name")) {
+        internal.insert(symbol.getValue());
+      }
+      return WalkResult::skip();
+    });
+  }
+
+private:
+  SmallString<0> newNameImpl(StringRef name) {
+    if (!internal.count(name)) {
+      internal.insert(name);
+      return name;
+    }
+    size_t i = 0;
+    SmallString<0> tryName;
+    do {
+      tryName = (name + "_" + Twine(i++)).str();
+    } while (internal.count(tryName));
+    return tryName;
+  }
+
+public:
+  SmallString<0> newName(StringRef name) { return newNameImpl(name); }
+  SmallString<0> newName(Twine name) { return newNameImpl(name.str()); }
+};
+
 struct Element {
   enum ElementKind {
     Error = -1,
@@ -402,15 +437,9 @@ private:
 
   SymbolTable *symbolTableRef;
 
-  SmallString<0> newName(StringRef name) {
-    if (!symbolTableRef->lookup(name))
-      return name;
-    size_t i = 0;
-    while (symbolTableRef->lookup((name + "_" + Twine(i++)).str()))
-      ;
-    return SmallString<0>((name + "_" + Twine(--i)).str());
-  }
+  CircuitNamespace *circuitNamespaceRef;
 };
+
 } // namespace
 
 bool GrandCentralPass::traverseField(AugmentedTypes::SumType field,
@@ -572,7 +601,7 @@ Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Annotation anno,
   if (buildIFace) {
     builder.setInsertionPointToEnd(getOperation().getBody());
     auto loc = getOperation().getLoc();
-    auto iFaceName = newName(bundle.defName.getValue());
+    auto iFaceName = circuitNamespaceRef->newName(bundle.defName.getValue());
     iface = builder.create<sv::InterfaceOp>(loc, iFaceName);
     iface->setAttr("output_file",
                    hw::OutputFileAttr::get(
@@ -580,17 +609,19 @@ Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Annotation anno,
                        builder.getStringAttr(iFaceName + ".sv"),
                        builder.getBoolAttr(true), builder.getBoolAttr(true),
                        builder.getContext()));
-    symbolTableRef->insert(iface);
 
     // If this is the root interface, then it needs to be instantiated in the
     // parent.
     if (bundle.isRoot()) {
       builder.setInsertionPointToEnd(
           parentIDMap.lookup(id).second.getBodyBlock());
+      auto symbolName = circuitNamespaceRef->newName(
+          ("__" + companionIDMap.lookup(id).name + "_" +
+           bundle.defName.getValue() + "__"));
+      llvm::errs() << "Try to add symbol: " << symbolName << "\n";
       auto instance = builder.create<sv::InterfaceInstanceOp>(
           loc, iface.getInterfaceType(), companionIDMap.lookup(id).name,
-          builder.getStringAttr("__" + companionIDMap.lookup(id).name + "_" +
-                                bundle.defName.getValue() + "__"));
+          builder.getStringAttr(symbolName));
 
       // If there was no bind file passed in, then we're not supposed to
       // extract this.  Delete the annotation and continue.
@@ -776,6 +807,9 @@ void GrandCentralPass::runOnOperation() {
   SymbolTable symbolTable(circuitOp);
   symbolTableRef = &symbolTable;
 
+  CircuitNamespace circuitNamespace(circuitOp);
+  circuitNamespaceRef = &circuitNamespace;
+
   removalError = false;
   circuitOp.walk([&](Operation *op) {
     TypeSwitch<Operation *>(op)
@@ -860,10 +894,12 @@ void GrandCentralPass::runOnOperation() {
             }
             if (tpe.getValue() == "companion") {
               builder.setInsertionPointToEnd(circuitOp.getBody());
+              auto mappingName =
+                  circuitNamespaceRef->newName(name.getValue() + "_mapping");
               auto mapping = builder.create<FModuleOp>(
-                  circuitOp.getLoc(),
-                  builder.getStringAttr(name.getValue() + "_mapping"),
+                  circuitOp.getLoc(), builder.getStringAttr(mappingName),
                   SmallVector<ModulePortInfo>({}));
+              symbolTable.insert(mapping);
               auto *ctx = builder.getContext();
               mapping->setAttr(
                   "output_file",
