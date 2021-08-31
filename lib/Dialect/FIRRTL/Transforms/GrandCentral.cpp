@@ -381,13 +381,14 @@ private:
   bool traverseField(AugmentedTypes::SumType field, SmallVector<Element> &tpe,
                      IntegerAttr id, Twine path, bool buildIFace = false);
 
-  bool traverseBundle(Annotation anno, IntegerAttr id = {}, Twine path = {},
-                      bool buildIFace = false);
+  Optional<sv::InterfaceOp> traverseBundle(Annotation anno, IntegerAttr id = {},
+                                           Twine path = {},
+                                           bool buildIFace = false);
 
   void buildInterfaceSignal(ArrayRef<Element> elements, OpBuilder &builder,
                             StringRef name, StringAttr description);
 
-  FModuleOp getEnclosingModule(Value value);
+  FModuleLike getEnclosingModule(Value value);
 
   // Inforamtion about how the circuit should be extracted.  This will be
   // non-empty if an extraction annotation is found.
@@ -398,6 +399,17 @@ private:
   }
 
   InstancePaths *instancePathsRef;
+
+  SymbolTable *symbolTableRef;
+
+  SmallString<0> newName(StringRef name) {
+    if (!symbolTableRef->lookup(name))
+      return name;
+    size_t i = 0;
+    while (symbolTableRef->lookup((name + "_" + Twine(i++)).str()))
+      ;
+    return SmallString<0>((name + "_" + Twine(--i)).str());
+  }
 };
 } // namespace
 
@@ -471,9 +483,13 @@ bool GrandCentralPass::traverseField(AugmentedTypes::SumType field,
   }
   case AugmentedTypes::Kind::Bundle: {
     auto bundle = AugmentedTypes::AugmentedType::Bundle::fromSumType(field);
+    auto iface =
+        traverseBundle(Annotation(*bundle.underlying), id, path, buildIFace);
+    if (!iface || !iface.getValue())
+      return false;
     if (buildIFace)
-      tpe.push_back(std::move(BundleKind(bundle.defName.getValue())));
-    return traverseBundle(Annotation(*bundle.underlying), id, path, buildIFace);
+      tpe.push_back(std::move(BundleKind(iface.getValue().getName())));
+    return true;
   }
   case AugmentedTypes::Kind::Unsupported: {
     auto unsupported =
@@ -516,14 +532,15 @@ bool GrandCentralPass::traverseField(AugmentedTypes::SumType field,
 /// the `buildIFace` parameter is true.  This is done to prevent interface
 /// construction for every element of a vector (and instead just create one
 /// interface for the whole vector).
-bool GrandCentralPass::traverseBundle(Annotation anno, IntegerAttr id,
-                                      Twine path, bool buildIFace) {
-
+Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Annotation anno,
+                                                           IntegerAttr id,
+                                                           Twine path,
+                                                           bool buildIFace) {
   BundleType bundle;
   if (auto maybeBundle = BundleType::fromAnno(anno))
     bundle = maybeBundle.getValue();
   else
-    return false;
+    return None;
 
   // Set the ID if it is not already set and verify that everything is setup for
   // further processing:
@@ -536,32 +553,34 @@ bool GrandCentralPass::traverseBundle(Annotation anno, IntegerAttr id,
     if (!id) {
       llvm::errs() << "missing 'id' in root-level BundleType: "
                    << anno.getDict() << "\n";
-      return false;
+      return None;
     }
     if (parentIDMap.count(id) == 0) {
       llvm::errs() << "no parent found with 'id' value '"
                    << id.getValue().getZExtValue() << "'\n";
-      return false;
+      return None;
     }
     if (companionIDMap.count(id) == 0) {
       llvm::errs() << "no companion found with 'id' value '"
                    << id.getValue().getZExtValue() << "'\n";
-      return false;
+      return None;
     }
   }
 
   auto builder = OpBuilder::atBlockEnd(getOperation().getBody());
+  sv::InterfaceOp iface;
   if (buildIFace) {
     builder.setInsertionPointToEnd(getOperation().getBody());
     auto loc = getOperation().getLoc();
-    sv::InterfaceOp iface =
-        builder.create<sv::InterfaceOp>(loc, bundle.defName.getValue());
+    auto iFaceName = newName(bundle.defName.getValue());
+    iface = builder.create<sv::InterfaceOp>(loc, iFaceName);
     iface->setAttr("output_file",
                    hw::OutputFileAttr::get(
                        builder.getStringAttr(getOutputDirectory()),
-                       builder.getStringAttr(bundle.defName.getValue() + ".sv"),
+                       builder.getStringAttr(iFaceName + ".sv"),
                        builder.getBoolAttr(true), builder.getBoolAttr(true),
                        builder.getContext()));
+    symbolTableRef->insert(iface);
 
     // If this is the root interface, then it needs to be instantiated in the
     // parent.
@@ -598,7 +617,7 @@ bool GrandCentralPass::traverseBundle(Annotation anno, IntegerAttr id,
   for (auto element : bundle.elements) {
     DictionaryAttr field = element.dyn_cast<DictionaryAttr>();
     if (!field)
-      return false;
+      return None;
     auto sumType = AugmentedTypes::fromDict(&field);
 
     auto name = field.getAs<StringAttr>("name");
@@ -611,13 +630,13 @@ bool GrandCentralPass::traverseBundle(Annotation anno, IntegerAttr id,
                            ? bundle.defName.getValue() + "." + name.getValue()
                            : path + "." + name.getValue(),
                        buildIFace))
-      return false;
+      return None;
 
     if (buildIFace)
       buildInterfaceSignal(tpe, builder, name.getValue(), description);
   }
 
-  return true;
+  return iface;
 }
 
 void GrandCentralPass::buildInterfaceSignal(ArrayRef<Element> elements,
@@ -691,13 +710,13 @@ void GrandCentralPass::buildInterfaceSignal(ArrayRef<Element> elements,
   builder.create<sv::VerbatimOp>(uloc, str);
 }
 
-FModuleOp GrandCentralPass::getEnclosingModule(Value value) {
+FModuleLike GrandCentralPass::getEnclosingModule(Value value) {
   if (auto blockArg = value.dyn_cast<BlockArgument>())
     return cast<FModuleOp>(blockArg.getOwner()->getParentOp());
 
   auto *op = value.getDefiningOp();
   if (InstanceOp instance = dyn_cast<InstanceOp>(op))
-    return cast<FModuleOp>(instance.getReferencedModule());
+    return instance.getReferencedModule();
 
   return op->getParentOfType<FModuleOp>();
 }
@@ -755,6 +774,7 @@ void GrandCentralPass::runOnOperation() {
   auto builder = OpBuilder::atBlockEnd(circuitOp.getBody());
 
   SymbolTable symbolTable(circuitOp);
+  symbolTableRef = &symbolTable;
 
   removalError = false;
   circuitOp.walk([&](Operation *op) {
