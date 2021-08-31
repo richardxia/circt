@@ -483,3 +483,68 @@ firrtl.circuit "BindInterfaceTest"  attributes {
 // CHECK-SAME: name = "InterfaceName.sv"
 // CHECK-SAME: @InterfaceName
 // CHECK-NEXT: sv.interface.signal @_a : i8
+
+// -----
+
+firrtl.circuit "MultipleGroundTypeInterfaces" attributes {
+  annotations = [
+    {class = "sifive.enterprise.grandcentral.AugmentedBundleType",
+     defName = "Foo",
+     elements = [
+       {class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+        name = "foo",
+        id = 1 : i64}],
+     id = 0 : i64},
+    {class = "sifive.enterprise.grandcentral.AugmentedBundleType",
+     defName = "Bar",
+     elements = [
+       {class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+        name = "foo",
+        id = 3 : i64}],
+     id = 2 : i64},
+    {class = "sifive.enterprise.grandcentral.ExtractGrandCentralAnnotation",
+     directory = "gct-dir",
+     filename = "gct-dir/bindings.sv"}]} {
+  firrtl.module @View_companion() attributes {
+    annotations = [
+      {class = "sifive.enterprise.grandcentral.ViewAnnotation",
+       defName = "Foo",
+       id = 0 : i64,
+       name = "View",
+       type = "companion"},
+      {class = "sifive.enterprise.grandcentral.ViewAnnotation",
+       defName = "Bar",
+       id = 2 : i64,
+       name = "View",
+       type = "companion"}]} {}
+  firrtl.module @DUT() attributes {
+    annotations = [
+      {class = "sifive.enterprise.grandcentral.ViewAnnotation",
+       id = 0 : i64,
+       name = "view",
+       type = "parent"},
+      {class = "sifive.enterprise.grandcentral.ViewAnnotation",
+       id = 2 : i64,
+       name = "view",
+       type = "parent"}
+    ]} {
+    %a = firrtl.wire {annotations = [
+      {a},
+      {class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+       id = 1 : i64},
+       {class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+       id = 3 : i64}]} : !firrtl.uint<2>
+    firrtl.instance @View_companion { name = "View_companion" }
+  }
+  firrtl.module @MultipleGroundTypeInterfaces() {
+    firrtl.instance @DUT {name = "dut" }
+  }
+}
+
+// CHECK: sv.interface {
+// CHECK-SAME: name = "Foo.sv"
+// CHECK-SAME: @Foo
+
+// CHECK: sv.interface {
+// CHECK-SAME: name = "Bar.sv"
+// CHECK-SAME: @Bar
