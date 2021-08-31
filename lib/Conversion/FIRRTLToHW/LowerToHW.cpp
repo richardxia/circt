@@ -2703,8 +2703,8 @@ LogicalResult FIRRTLLowering::visitStmt(ForceOp op) {
   if (!destVal)
     return failure();
 
-  // if (!destVal.getType().isa<hw::InOutType>())
-  //   return op.emitError("destination isn't an inout type");
+  if (!destVal.getType().isa<hw::InOutType>())
+    return op.emitError("destination isn't an inout type");
 
   addToInitialBlock([&]() { builder.create<sv::ForceOp>(destVal, srcVal); });
   return success();
