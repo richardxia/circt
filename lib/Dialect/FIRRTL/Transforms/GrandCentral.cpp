@@ -94,13 +94,16 @@ static SumType fromDict(DictionaryAttr *dict) {
 
   assert(false && "wasn't able to build SumType from dict");
   return SumType::create<Kind::Error>(dict);
-};
+}
 
 struct Bundle {
   IntegerAttr id;
   StringAttr defName;
   ArrayAttr elements;
   DictionaryAttr *underlying;
+
+  bool isRoot() { return id != nullptr; }
+
   static Bundle fromSumType(SumType a) {
     auto *dict = a.get<Kind::Bundle>();
     assert(dict && "input must be a Bundle type");
@@ -276,7 +279,7 @@ private:
   std::variant<llvm::SmallString<0>, SumType, Type>
   computeField(SumType field, IntegerAttr id, Twine path);
 
-  Optional<sv::InterfaceOp> traverseBundle(Annotation anno, IntegerAttr id = {},
+  Optional<sv::InterfaceOp> traverseBundle(Bundle bundle, IntegerAttr id = {},
                                            Twine path = {},
                                            bool buildIFace = false);
 
@@ -356,8 +359,7 @@ bool GrandCentralPass::traverseField(SumType field, IntegerAttr id,
   }
   case Kind::Bundle: {
     auto bundle = Bundle::fromSumType(field);
-    auto iface =
-        traverseBundle(Annotation(*bundle.underlying), id, path, false);
+    auto iface = traverseBundle(bundle, id, path, false);
     if (!iface || !iface.getValue())
       return false;
     return true;
@@ -415,7 +417,7 @@ GrandCentralPass::computeField(SumType field, IntegerAttr id, Twine path) {
   }
   case Kind::Bundle: {
     auto bundle = Bundle::fromSumType(field);
-    auto iface = traverseBundle(Annotation(*bundle.underlying), id, path, true);
+    auto iface = traverseBundle(bundle, id, path, true);
     assert(iface && iface.getValue());
     return SmallString<0>(
         (iface.getValue().getName() + " " + iface.getValue().getName()).str());
@@ -441,16 +443,10 @@ GrandCentralPass::computeField(SumType field, IntegerAttr id, Twine path) {
 /// the `buildIFace` parameter is true.  This is done to prevent interface
 /// construction for every element of a vector (and instead just create one
 /// interface for the whole vector).
-Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Annotation anno,
+Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Bundle bundle,
                                                            IntegerAttr id,
                                                            Twine path,
                                                            bool buildIFace) {
-  BundleType bundle;
-  if (auto maybeBundle = BundleType::fromAnno(anno))
-    bundle = maybeBundle.getValue();
-  else
-    return None;
-
   // Set the ID if it is not already set and verify that everything is setup for
   // further processing:
   //   1. If the ID isn't set, then this must be the top-level BundleType.
@@ -461,7 +457,7 @@ Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Annotation anno,
     id = bundle.id;
     if (!id) {
       llvm::errs() << "missing 'id' in root-level BundleType: "
-                   << anno.getDict() << "\n";
+                   << *bundle.underlying << "\n";
       return None;
     }
     if (parentIDMap.count(id) == 0) {
@@ -910,8 +906,15 @@ void GrandCentralPass::runOnOperation() {
     if (!anno.isClass("sifive.enterprise.grandcentral.AugmentedBundleType"))
       return false;
 
-    auto id = anno.getMember<IntegerAttr>("id");
-    if (!traverseBundle(anno, {}, companionIDMap.lookup(id).name, true)) {
+    auto dict = anno.getDict();
+    SumType sumType = fromDict(&dict);
+    if (!sumType.is<Kind::Bundle>())
+      return false;
+
+    llvm::errs() << "tag is: " << sumType.getTag() << "\n";
+    auto bundle = Bundle::fromSumType(sumType);
+    if (!traverseBundle(bundle, {}, companionIDMap.lookup(bundle.id).name,
+                        true)) {
       emitCircuitError(
           "'firrtl.circuit' op contained an 'AugmentedBundleType' "
           "Annotation which did not conform to the expected format")
