@@ -37,6 +37,10 @@ namespace Kind {
 enum Kind { Error, Ground, Vector, Bundle, Unsupported };
 } // namespace Kind
 
+/// Adds type information to a DictionaryAttr by using PointerSumType.  These
+/// are used to add type information to an unstructured annotation to certify
+/// that it is of a specific type.  This allows verification to be separated
+/// from use.
 typedef PointerSumType<
     Kind::Kind, PointerSumTypeMember<Kind::Error, DictionaryAttr *>,
     PointerSumTypeMember<Kind::Ground, DictionaryAttr *>,
@@ -100,7 +104,6 @@ struct Bundle {
   IntegerAttr id;
   StringAttr defName;
   ArrayAttr elements;
-  DictionaryAttr *underlying;
 
   bool isRoot() { return id != nullptr; }
 
@@ -109,7 +112,7 @@ struct Bundle {
     assert(dict && "input must be a Bundle type");
     return Bundle({dict->getAs<IntegerAttr>("id"),
                    dict->getAs<StringAttr>("defName"),
-                   dict->getAs<ArrayAttr>("elements"), dict});
+                   dict->getAs<ArrayAttr>("elements")});
   }
 };
 
@@ -393,48 +396,23 @@ GrandCentralPass::computeField(SumType field, IntegerAttr id, Twine path) {
   }
 }
 
-/// Traverse an Annotation that is an AugmentedBundleType.  During traversal,
-/// construct any discovered SystemVerilog interfaces.  If this is the root
-/// interface, instantiate that interface in the parent.  Recurse into fields of
-/// the AugmentedBundleType to construct nested interfaces and generate
-/// stringy-typed SystemVerilog hierarchical references to drive the interface.
-/// Returns false on any failure and true on success.
+/// Traverse an Annotation that is an AugmentedBundleType.  During
+/// traversal, construct any discovered SystemVerilog interfaces.  If this
+/// is the root interface, instantiate that interface in the parent. Recurse
+/// into fields of the AugmentedBundleType to construct nested interfaces
+/// and generate stringy-typed SystemVerilog hierarchical references to
+/// drive the interface. Returns false on any failure and true on success.
 ///
 /// This is a normal tree traversal with dual effects.  This traversal will
 /// always generate the hierarchical refernces (as these are located at the
-/// leaves of the Annotation).  However, this only generates the interface if
-/// the `buildIFace` parameter is true.  This is done to prevent interface
-/// construction for every element of a vector (and instead just create one
-/// interface for the whole vector).
+/// leaves of the Annotation).  However, this only generates the interface
+/// if the `buildIFace` parameter is true.  This is done to prevent
+/// interface construction for every element of a vector (and instead just
+/// create one interface for the whole vector).
 Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Bundle bundle,
                                                            IntegerAttr id,
                                                            Twine path,
                                                            bool buildIFace) {
-  // Set the ID if it is not already set and verify that everything is setup for
-  // further processing:
-  //   1. If the ID isn't set, then this must be the top-level BundleType.
-  //      Ensure that it is by checking that the BundleType has an ID.
-  //   2. A parent must have been found in the circuit.
-  //   3. A companion must have been found in the circuit.
-  if (!id) {
-    id = bundle.id;
-    if (!id) {
-      llvm::errs() << "missing 'id' in root-level BundleType: "
-                   << *bundle.underlying << "\n";
-      return None;
-    }
-    if (parentIDMap.count(id) == 0) {
-      llvm::errs() << "no parent found with 'id' value '"
-                   << id.getValue().getZExtValue() << "'\n";
-      return None;
-    }
-    if (companionIDMap.count(id) == 0) {
-      llvm::errs() << "no companion found with 'id' value '"
-                   << id.getValue().getZExtValue() << "'\n";
-      return None;
-    }
-  }
-
   auto builder = OpBuilder::atBlockEnd(getOperation().getBody());
   sv::InterfaceOp iface;
   if (buildIFace) {
@@ -874,10 +852,26 @@ void GrandCentralPass::runOnOperation() {
     if (!sumType.is<Kind::Bundle>())
       return false;
 
-    llvm::errs() << "tag is: " << sumType.getTag() << "\n";
     auto bundle = Bundle::fromSumType(sumType);
-    if (!traverseBundle(bundle, {}, companionIDMap.lookup(bundle.id).name,
-                        true)) {
+    if (!bundle.isRoot()) {
+      llvm::errs() << "missing 'id' in root-level BundleType: " << dict << "\n";
+      removalError = true;
+      return false;
+    }
+    if (parentIDMap.count(bundle.id) == 0) {
+      llvm::errs() << "no parent found with 'id' value '"
+                   << bundle.id.getValue().getZExtValue() << "'\n";
+      removalError = true;
+      return false;
+    }
+    if (companionIDMap.count(bundle.id) == 0) {
+      llvm::errs() << "no companion found with 'id' value '"
+                   << bundle.id.getValue().getZExtValue() << "'\n";
+      removalError = true;
+      return false;
+    }
+    if (!traverseBundle(bundle, bundle.id,
+                        companionIDMap.lookup(bundle.id).name, true)) {
       emitCircuitError(
           "'firrtl.circuit' op contained an 'AugmentedBundleType' "
           "Annotation which did not conform to the expected format")
