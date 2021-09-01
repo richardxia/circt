@@ -31,7 +31,7 @@ using llvm::PointerSumTypeMember;
 // Pass Implementation
 //===----------------------------------------------------------------------===//
 
-namespace AugmentedTypes {
+namespace {
 
 namespace Kind {
 enum Kind { Error, Ground, Vector, Bundle, Unsupported };
@@ -96,14 +96,13 @@ static SumType fromDict(DictionaryAttr *dict) {
   return SumType::create<Kind::Error>(dict);
 };
 
-namespace AugmentedType {
 struct Bundle {
   IntegerAttr id;
   StringAttr defName;
   ArrayAttr elements;
   DictionaryAttr *underlying;
-  static Bundle fromSumType(AugmentedTypes::SumType a) {
-    auto *dict = a.get<AugmentedTypes::Kind::Bundle>();
+  static Bundle fromSumType(SumType a) {
+    auto *dict = a.get<Kind::Bundle>();
     assert(dict && "input must be a Bundle type");
     return Bundle({dict->getAs<IntegerAttr>("id"),
                    dict->getAs<StringAttr>("defName"),
@@ -114,8 +113,8 @@ struct Bundle {
 struct Vector {
   StringAttr name;
   ArrayAttr elements;
-  static Vector fromSumType(AugmentedTypes::SumType a) {
-    auto *dict = a.get<AugmentedTypes::Kind::Vector>();
+  static Vector fromSumType(SumType a) {
+    auto *dict = a.get<Kind::Vector>();
     assert(dict && "input must be a Vector type");
     return Vector(
         {dict->getAs<StringAttr>("name"), dict->getAs<ArrayAttr>("elements")});
@@ -125,8 +124,8 @@ struct Vector {
 struct Ground {
   IntegerAttr id;
   StringAttr name;
-  static Ground fromSumType(AugmentedTypes::SumType a) {
-    auto *dict = a.get<AugmentedTypes::Kind::Ground>();
+  static Ground fromSumType(SumType a) {
+    auto *dict = a.get<Kind::Ground>();
     assert(dict && "input must be a Ground type");
     return Ground(
         {dict->getAs<IntegerAttr>("id"), dict->getAs<StringAttr>("name")});
@@ -137,19 +136,13 @@ struct Unsupported {
   StringAttr clazz;
   StringAttr name;
   DictionaryAttr *underlying;
-  static Unsupported fromSumType(AugmentedTypes::SumType a) {
-    auto *dict = a.get<AugmentedTypes::Kind::Unsupported>();
+  static Unsupported fromSumType(SumType a) {
+    auto *dict = a.get<Kind::Unsupported>();
     assert(dict && "input must be an Unsupported type");
     return Unsupported({dict->getAs<StringAttr>("class"),
                         dict->getAs<StringAttr>("name"), dict});
   }
 };
-
-} // namespace AugmentedType
-
-} // namespace AugmentedTypes
-
-namespace {
 
 struct CircuitNamespace {
 
@@ -313,10 +306,10 @@ private:
   // Mapping of ID to companion module.
   llvm::DenseMap<Attribute, CompanionInfo> companionIDMap;
 
-  bool traverseField(AugmentedTypes::SumType field, IntegerAttr id, Twine path);
+  bool traverseField(SumType field, IntegerAttr id, Twine path);
 
-  std::variant<llvm::SmallString<0>, AugmentedTypes::SumType, Type>
-  computeField(AugmentedTypes::SumType field, IntegerAttr id, Twine path);
+  std::variant<llvm::SmallString<0>, SumType, Type>
+  computeField(SumType field, IntegerAttr id, Twine path);
 
   Optional<sv::InterfaceOp> traverseBundle(Annotation anno, IntegerAttr id = {},
                                            Twine path = {},
@@ -341,11 +334,11 @@ private:
 
 } // namespace
 
-bool GrandCentralPass::traverseField(AugmentedTypes::SumType field,
-                                     IntegerAttr id, Twine path) {
+bool GrandCentralPass::traverseField(SumType field, IntegerAttr id,
+                                     Twine path) {
   switch (field.getTag()) {
-  case AugmentedTypes::Kind::Ground: {
-    auto ground = AugmentedTypes::AugmentedType::Ground::fromSumType(field);
+  case Kind::Ground: {
+    auto ground = Ground::fromSumType(field);
 
     // TODO: move this into the sumtype verification.
     auto leafValue = leafMap.lookup(ground.id);
@@ -384,26 +377,26 @@ bool GrandCentralPass::traverseField(AugmentedTypes::SumType field,
                                                ";");
     return true;
   }
-  case AugmentedTypes::Kind::Vector: {
-    auto vector = AugmentedTypes::AugmentedType::Vector::fromSumType(field);
+  case Kind::Vector: {
+    auto vector = Vector::fromSumType(field);
     bool notFailed = true;
     for (size_t i = 0, e = vector.elements.size(); i != e; ++i) {
       auto dict = vector.elements[i].dyn_cast<DictionaryAttr>();
       if (!dict)
         return false;
-      auto sumType = AugmentedTypes::fromDict(&dict);
+      auto sumType = fromDict(&dict);
       notFailed &= traverseField(sumType, id, path + "[" + Twine(i) + "]");
     }
     return notFailed;
   }
-  case AugmentedTypes::Kind::Bundle: {
-    auto bundle = AugmentedTypes::AugmentedType::Bundle::fromSumType(field);
+  case Kind::Bundle: {
+    auto bundle = Bundle::fromSumType(field);
     auto iface = traverseBundle(Annotation(*bundle.underlying), id, path);
     if (!iface || !iface.getValue())
       return false;
     return true;
   }
-  case AugmentedTypes::Kind::Unsupported: {
+  case Kind::Unsupported: {
     return true;
   }
   default:
@@ -411,12 +404,11 @@ bool GrandCentralPass::traverseField(AugmentedTypes::SumType field,
   }
 }
 
-std::variant<SmallString<0>, AugmentedTypes::SumType, Type>
-GrandCentralPass::computeField(AugmentedTypes::SumType field, IntegerAttr id,
-                               Twine path) {
+std::variant<SmallString<0>, SumType, Type>
+GrandCentralPass::computeField(SumType field, IntegerAttr id, Twine path) {
   switch (field.getTag()) {
-  case AugmentedTypes::Kind::Ground: {
-    auto ground = AugmentedTypes::AugmentedType::Ground::fromSumType(field);
+  case Kind::Ground: {
+    auto ground = Ground::fromSumType(field);
 
     // TODO: move this into the sumtype verification.
     auto leafValue = leafMap.lookup(ground.id);
@@ -433,15 +425,15 @@ GrandCentralPass::computeField(AugmentedTypes::SumType field, IntegerAttr id,
         getOperation().getContext(),
         leafValue.getType().cast<FIRRTLType>().getBitWidthOrSentinel());
   }
-  case AugmentedTypes::Kind::Vector: {
+  case Kind::Vector: {
     bool notFailed = true;
-    std::variant<SmallString<0>, AugmentedTypes::SumType, Type> elementType;
-    auto vector = AugmentedTypes::AugmentedType::Vector::fromSumType(field);
+    std::variant<SmallString<0>, SumType, Type> elementType;
+    auto vector = Vector::fromSumType(field);
 
     for (size_t i = 0, e = vector.elements.size(); i != e; ++i) {
       auto dict = vector.elements[i].dyn_cast<DictionaryAttr>();
       assert(dict && "not a dict");
-      auto sumType = AugmentedTypes::fromDict(&dict);
+      auto sumType = fromDict(&dict);
       if (i == 0)
         elementType = computeField(sumType, id, path + "[" + Twine(i) + "]");
       else
@@ -455,14 +447,14 @@ GrandCentralPass::computeField(AugmentedTypes::SumType field, IntegerAttr id,
     str.append(("[" + Twine(vector.elements.getValue().size()) + "]").str());
     return str;
   }
-  case AugmentedTypes::Kind::Bundle: {
-    auto bundle = AugmentedTypes::AugmentedType::Bundle::fromSumType(field);
+  case Kind::Bundle: {
+    auto bundle = Bundle::fromSumType(field);
     auto iface = traverseBundle(Annotation(*bundle.underlying), id, path, true);
     assert(iface && iface.getValue());
     return SmallString<0>(
         (iface.getValue().getName() + " " + iface.getValue().getName()).str());
   }
-  case AugmentedTypes::Kind::Unsupported: {
+  case Kind::Unsupported: {
     return field;
   }
   default:
@@ -571,7 +563,7 @@ Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Annotation anno,
     DictionaryAttr field = element.dyn_cast<DictionaryAttr>();
     if (!field)
       return None;
-    auto sumType = AugmentedTypes::fromDict(&field);
+    auto sumType = fromDict(&field);
 
     auto name = field.getAs<StringAttr>("name");
     if (!name)
@@ -594,9 +586,8 @@ Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Annotation anno,
         continue;
       }
 
-      if (auto *ptr = std::get_if<AugmentedTypes::SumType>(&elementType)) {
-        auto unsupported =
-            AugmentedTypes::AugmentedType::Unsupported::fromSumType(*ptr);
+      if (auto *ptr = std::get_if<SumType>(&elementType)) {
+        auto unsupported = Unsupported::fromSumType(*ptr);
         auto classBase = unsupported.clazz.getValue();
         classBase.consume_front("sifive.enterprise.grandcentral.Augmented");
         if (classBase == "StringType") {
