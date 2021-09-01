@@ -391,7 +391,8 @@ bool GrandCentralPass::traverseField(SumType field, IntegerAttr id,
   }
   case Kind::Bundle: {
     auto bundle = Bundle::fromSumType(field);
-    auto iface = traverseBundle(Annotation(*bundle.underlying), id, path);
+    auto iface =
+        traverseBundle(Annotation(*bundle.underlying), id, path, false);
     if (!iface || !iface.getValue())
       return false;
     return true;
@@ -568,8 +569,6 @@ Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Annotation anno,
     auto name = field.getAs<StringAttr>("name");
     if (!name)
       name = field.getAs<StringAttr>("defName");
-    auto description = field.getAs<StringAttr>("description");
-
     auto elementType =
         computeField(sumType, id,
                      path.isTriviallyEmpty()
@@ -578,6 +577,7 @@ Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Annotation anno,
 
     if (buildIFace) {
       auto uloc = builder.getUnknownLoc();
+      auto description = field.getAs<StringAttr>("description");
       if (description)
         builder.create<sv::VerbatimOp>(uloc,
                                        ("// " + description.getValue()).str());
