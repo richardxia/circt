@@ -186,106 +186,6 @@ public:
   SmallString<0> newName(Twine name) { return newNameImpl(name.str()); }
 };
 
-struct Element {
-  enum ElementKind {
-    Error = -1,
-    Bundle,
-    Vector,
-    Ground,
-    String,
-    Boolean,
-    Integer,
-    Double
-  };
-
-  const ElementKind kind;
-
-  StringRef name;
-
-  uint64_t storage;
-
-  ElementKind getKind() const { return kind; }
-};
-
-struct BundleKind : public Element {
-  BundleKind(StringRef name) : Element({ElementKind::Bundle, name, 0}) {}
-  static bool classof(const Element *e) {
-    return e->getKind() == ElementKind::Bundle;
-  }
-};
-
-struct VectorKind : public Element {
-  VectorKind(StringRef name, uint64_t depth)
-      : Element({ElementKind::Vector, name, depth}) {}
-  static bool classof(const Element *e) {
-    return e->getKind() == ElementKind::Vector;
-  }
-  uint64_t getDepth() const { return storage; }
-};
-
-struct GroundKind : public Element {
-public:
-  GroundKind(StringRef name, uint64_t width)
-      : Element({ElementKind::Ground, name, width}) {}
-  static bool classof(const Element *e) {
-    return e->getKind() == ElementKind::Ground;
-  }
-  uint64_t getWidth() const { return storage; }
-};
-
-struct StringKind : public Element {
-  StringKind(StringRef name) : Element({ElementKind::String, name, 0}) {}
-  static bool classof(const Element *e) {
-    return e->getKind() == ElementKind::String;
-  }
-};
-
-struct BooleanKind : public Element {
-  BooleanKind(StringRef name) : Element({ElementKind::Boolean, name, 0}) {}
-  static bool classof(const Element *e) {
-    return e->getKind() == ElementKind::Boolean;
-  }
-};
-
-struct IntegerKind : public Element {
-  IntegerKind(StringRef name) : Element({ElementKind::Integer, name, 0}) {}
-  static bool classof(const Element *e) {
-    return e->getKind() == ElementKind::Integer;
-  }
-};
-
-struct DoubleKind : public Element {
-  DoubleKind(StringRef name) : Element({ElementKind::Double, name, 0}) {}
-  static bool classof(const Element *e) {
-    return e->getKind() == ElementKind::Double;
-  }
-};
-
-struct AugmentedType {
-  enum Kind {
-    Error = -1,
-    String,
-    Integer,
-    Double,
-    Boolean,
-    Literal,
-    Deleted,
-    Ground,
-    Vector,
-    Bundle
-  };
-  Kind kind;
-  Kind getKind() const { return kind; }
-
-  // Construct an optional AugmentedType concrete struct from an arbitrary
-  // Attribute.  This does all checking of the Attribute to guarantee that the
-  // returned AugmentedType is valid.
-  static Optional<AugmentedType> fromAttr(Attribute attribute);
-  static Optional<AugmentedType> fromAnno(Annotation annotation) {
-    return fromAttr(annotation.getDict());
-  }
-};
-
 /// The data content of an AugmentedBundleType.
 struct BundleType {
   StringAttr defName;
@@ -413,15 +313,14 @@ private:
   // Mapping of ID to companion module.
   llvm::DenseMap<Attribute, CompanionInfo> companionIDMap;
 
-  bool traverseField(AugmentedTypes::SumType field, SmallVector<Element> &tpe,
-                     IntegerAttr id, Twine path, bool buildIFace = false);
+  bool traverseField(AugmentedTypes::SumType field, IntegerAttr id, Twine path);
+
+  std::variant<llvm::SmallString<0>, AugmentedTypes::SumType, Type>
+  computeField(AugmentedTypes::SumType field, IntegerAttr id, Twine path);
 
   Optional<sv::InterfaceOp> traverseBundle(Annotation anno, IntegerAttr id = {},
                                            Twine path = {},
                                            bool buildIFace = false);
-
-  void buildInterfaceSignal(ArrayRef<Element> elements, OpBuilder &builder,
-                            StringRef name, StringAttr description);
 
   FModuleLike getEnclosingModule(Value value);
 
@@ -443,8 +342,7 @@ private:
 } // namespace
 
 bool GrandCentralPass::traverseField(AugmentedTypes::SumType field,
-                                     SmallVector<Element> &tpe, IntegerAttr id,
-                                     Twine path, bool buildIFace) {
+                                     IntegerAttr id, Twine path) {
   switch (field.getTag()) {
   case AugmentedTypes::Kind::Ground: {
     auto ground = AugmentedTypes::AugmentedType::Ground::fromSumType(field);
@@ -484,64 +382,88 @@ bool GrandCentralPass::traverseField(AugmentedTypes::SumType field,
                                                    .cast<StringAttr>()
                                                    .getValue() +
                                                ";");
-
-    auto width = leafValue.getType().cast<FIRRTLType>().getBitWidthOrSentinel();
-    // The name will exist if this is a ground type or a ground type of a bundle
-    // type.  There is expected to be no name if this is a ground type of a
-    // vector type.
-    if (buildIFace)
-      tpe.push_back(
-          GroundKind(ground.name ? ground.name.getValue() : "", width));
     return true;
   }
   case AugmentedTypes::Kind::Vector: {
     auto vector = AugmentedTypes::AugmentedType::Vector::fromSumType(field);
-    if (buildIFace)
-      tpe.push_back(std::move(VectorKind(vector.name.getValue(),
-                                         vector.elements.getValue().size())));
     bool notFailed = true;
     for (size_t i = 0, e = vector.elements.size(); i != e; ++i) {
       auto dict = vector.elements[i].dyn_cast<DictionaryAttr>();
       if (!dict)
         return false;
       auto sumType = AugmentedTypes::fromDict(&dict);
-      notFailed &= traverseField(sumType, tpe, id, path + "[" + Twine(i) + "]",
-                                 (i == 0) && buildIFace);
+      notFailed &= traverseField(sumType, id, path + "[" + Twine(i) + "]");
     }
     return notFailed;
   }
   case AugmentedTypes::Kind::Bundle: {
     auto bundle = AugmentedTypes::AugmentedType::Bundle::fromSumType(field);
-    auto iface =
-        traverseBundle(Annotation(*bundle.underlying), id, path, buildIFace);
+    auto iface = traverseBundle(Annotation(*bundle.underlying), id, path);
     if (!iface || !iface.getValue())
       return false;
-    if (buildIFace)
-      tpe.push_back(std::move(BundleKind(iface.getValue().getName())));
     return true;
   }
   case AugmentedTypes::Kind::Unsupported: {
-    auto unsupported =
-        AugmentedTypes::AugmentedType::Unsupported::fromSumType(field);
-    auto classBase = unsupported.clazz.getValue();
-    classBase.consume_front("sifive.enterprise.grandcentral.Augmented");
-    if (classBase == "StringType") {
-      tpe.push_back(StringKind(unsupported.name.getValue()));
-      return true;
+    return true;
+  }
+  default:
+    assert(false && "unhandled");
+  }
+}
+
+std::variant<SmallString<0>, AugmentedTypes::SumType, Type>
+GrandCentralPass::computeField(AugmentedTypes::SumType field, IntegerAttr id,
+                               Twine path) {
+  switch (field.getTag()) {
+  case AugmentedTypes::Kind::Ground: {
+    auto ground = AugmentedTypes::AugmentedType::Ground::fromSumType(field);
+
+    // TODO: move this into the sumtype verification.
+    auto leafValue = leafMap.lookup(ground.id);
+    if (!leafValue) {
+      llvm::errs() << "missing 'leafValue' for GroundType with id " << ground.id
+                   << "\n";
+      assert(false);
     }
-    if (classBase == "BooleanType") {
-      tpe.push_back(BooleanKind(unsupported.name.getValue()));
-      return true;
+
+    // Traverse to generate mappings.
+    traverseField(field, id, path);
+
+    return IntegerType::get(
+        getOperation().getContext(),
+        leafValue.getType().cast<FIRRTLType>().getBitWidthOrSentinel());
+  }
+  case AugmentedTypes::Kind::Vector: {
+    bool notFailed = true;
+    std::variant<SmallString<0>, AugmentedTypes::SumType, Type> elementType;
+    auto vector = AugmentedTypes::AugmentedType::Vector::fromSumType(field);
+
+    for (size_t i = 0, e = vector.elements.size(); i != e; ++i) {
+      auto dict = vector.elements[i].dyn_cast<DictionaryAttr>();
+      assert(dict && "not a dict");
+      auto sumType = AugmentedTypes::fromDict(&dict);
+      if (i == 0)
+        elementType = computeField(sumType, id, path + "[" + Twine(i) + "]");
+      else
+        notFailed &= traverseField(sumType, id, path + "[" + Twine(i) + "]");
     }
-    if (classBase == "IntegerType") {
-      tpe.push_back(IntegerKind(unsupported.name.getValue()));
-      return true;
-    }
-    if (classBase == "DoubleType") {
-      tpe.push_back(DoubleKind(unsupported.name.getValue()));
-      return true;
-    }
-    LLVM_FALLTHROUGH;
+
+    if (auto *tpe = std::get_if<Type>(&elementType))
+      return hw::UnpackedArrayType::get(*tpe,
+                                        vector.elements.getValue().size());
+    auto str = std::get<SmallString<0>>(elementType);
+    str.append(("[" + Twine(vector.elements.getValue().size()) + "]").str());
+    return str;
+  }
+  case AugmentedTypes::Kind::Bundle: {
+    auto bundle = AugmentedTypes::AugmentedType::Bundle::fromSumType(field);
+    auto iface = traverseBundle(Annotation(*bundle.underlying), id, path, true);
+    assert(iface && iface.getValue());
+    return SmallString<0>(
+        (iface.getValue().getName() + " " + iface.getValue().getName()).str());
+  }
+  case AugmentedTypes::Kind::Unsupported: {
+    return field;
   }
   default:
     assert(false && "unhandled");
@@ -655,90 +577,54 @@ Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Annotation anno,
     if (!name)
       name = field.getAs<StringAttr>("defName");
     auto description = field.getAs<StringAttr>("description");
-    SmallVector<Element> tpe;
-    if (!traverseField(sumType, tpe, id,
-                       path.isTriviallyEmpty()
-                           ? bundle.defName.getValue() + "." + name.getValue()
-                           : path + "." + name.getValue(),
-                       buildIFace))
-      return None;
 
-    if (buildIFace)
-      buildInterfaceSignal(tpe, builder, name.getValue(), description);
+    auto elementType =
+        computeField(sumType, id,
+                     path.isTriviallyEmpty()
+                         ? bundle.defName.getValue() + "." + name.getValue()
+                         : path + "." + name.getValue());
+
+    if (buildIFace) {
+      auto uloc = builder.getUnknownLoc();
+      if (description)
+        builder.create<sv::VerbatimOp>(uloc,
+                                       ("// " + description.getValue()).str());
+      if (auto *str = std::get_if<SmallString<0>>(&elementType)) {
+        builder.create<sv::VerbatimOp>(uloc, str->str() + "();");
+        continue;
+      }
+
+      if (auto *ptr = std::get_if<AugmentedTypes::SumType>(&elementType)) {
+        auto unsupported =
+            AugmentedTypes::AugmentedType::Unsupported::fromSumType(*ptr);
+        auto classBase = unsupported.clazz.getValue();
+        classBase.consume_front("sifive.enterprise.grandcentral.Augmented");
+        if (classBase == "StringType") {
+          builder.create<sv::VerbatimOp>(uloc,
+                                         "// " + unsupported.name.getValue() +
+                                             " = <unsupported string type>;");
+        } else if (classBase == "BooleanType") {
+          builder.create<sv::VerbatimOp>(uloc,
+                                         "// " + unsupported.name.getValue() +
+                                             " = <unsupported boolean type>;");
+        } else if (classBase == "IntegerType") {
+          builder.create<sv::VerbatimOp>(uloc,
+                                         "// " + unsupported.name.getValue() +
+                                             " = <unsupported integer type>;");
+        } else if (classBase == "DoubleType") {
+          builder.create<sv::VerbatimOp>(uloc,
+                                         "// " + unsupported.name.getValue() +
+                                             " = <unsupported double type>;");
+        }
+        continue;
+      }
+
+      builder.create<sv::InterfaceSignalOp>(uloc, name.getValue(),
+                                            std::get<Type>(elementType));
+    }
   }
 
   return iface;
-}
-
-void GrandCentralPass::buildInterfaceSignal(ArrayRef<Element> elements,
-                                            OpBuilder &builder, StringRef name,
-                                            StringAttr description) {
-
-  // This is walking a sequency of element types to build up a representation of
-  // an interface signal.  This is either an actual interface signal type or a
-  // string representing something that is another interface.  This is using a
-  // string for a nested interface due to existing limitations around doing this
-  // in the SV dialect (see: https://github.com/llvm/circt/issues/1171).
-  std::string str;
-  llvm::raw_string_ostream s(str);
-  Type tpe;
-  bool isIface = false;
-  for (auto element : llvm::reverse(elements)) {
-    TypeSwitch<Element *>(&element)
-        .Case<GroundKind>(
-            [&](auto a) { tpe = builder.getIntegerType(a->getWidth()); })
-        .Case<VectorKind>([&](auto a) {
-          if (!str.empty()) {
-            s << "[" << a->getDepth() << "]";
-            return;
-          }
-          tpe = hw::UnpackedArrayType::get(tpe, a->getDepth());
-        })
-        .Case<BundleKind>([&](auto a) {
-          isIface = true;
-          s << a->name << " " << name;
-        })
-        .Case<StringKind>([&](auto a) {
-          assert(elements.size() == 1);
-          s << "// " << a->name << " = "
-            << "<unsupported string type>";
-        })
-        .Case<BooleanKind>([&](auto a) {
-          assert(elements.size() == 1);
-          s << "// " << a->name << " = "
-            << "<unsupported boolean type>";
-        })
-        .Case<IntegerKind>([&](auto a) {
-          assert(elements.size() == 1);
-          s << "// " << a->name << " = "
-            << "<unsupported integer type>";
-        })
-        .Case<DoubleKind>([&](auto a) {
-          assert(elements.size() == 1);
-          s << "// " << a->name << " = "
-            << "<unsupported double type>";
-        });
-  }
-
-  // If this is an interface, then add a "()" at the end.  This is enabling
-  // vectors of interfaces which have to be constructed like:
-  //
-  //     Foo Foo[2][4][8]()
-  if (isIface)
-    s << "()";
-
-  // Construct the type, included an optional description.
-  auto uloc = builder.getUnknownLoc();
-  if (description)
-    builder.create<sv::VerbatimOp>(uloc,
-                                   ("// " + description.getValue()).str());
-  if (str.empty()) {
-    builder.create<sv::InterfaceSignalOp>(getOperation().getLoc(), name, tpe);
-    return;
-  }
-
-  s << ";";
-  builder.create<sv::VerbatimOp>(uloc, str);
 }
 
 FModuleLike GrandCentralPass::getEnclosingModule(Value value) {
