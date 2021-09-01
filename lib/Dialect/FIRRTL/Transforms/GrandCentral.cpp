@@ -216,41 +216,6 @@ struct BundleType {
   bool isRoot() { return id != nullptr; }
 };
 
-/// The data content of an AugmentedFieldType.
-struct FieldType {
-  StringAttr clazz;
-  StringAttr name;
-  StringAttr description;
-  ArrayAttr elements;
-  IntegerAttr id;
-
-  DictionaryAttr original;
-
-  /// Optionally construct a FieldType from an Attribute, returning None if the
-  /// Attribute does not match the expected format.
-  static Optional<FieldType> fromAttr(Attribute attribute) {
-    auto dictionary = attribute.dyn_cast_or_null<DictionaryAttr>();
-    if (!dictionary) {
-      llvm::errs() << "non-dictionary attribute used to construct a FieldType: "
-                   << attribute << "\n";
-      return None;
-    }
-
-    auto clazz = dictionary.getAs<StringAttr>("class");
-    auto name = dictionary.getAs<StringAttr>("name");
-    if (!name)
-      name = dictionary.getAs<StringAttr>("defName");
-    if (!clazz || !name) {
-      llvm::errs() << "field missing 'class' or 'name'/'defName' in: "
-                   << dictionary << "\n";
-      return None;
-    }
-    return FieldType({clazz, name, dictionary.getAs<StringAttr>("description"),
-                      dictionary.getAs<ArrayAttr>("elements"),
-                      dictionary.getAs<IntegerAttr>("id"), dictionary});
-  }
-};
-
 /// Stores the information content of an ExtractGrandCentralAnnotation.
 struct ExtractionInfo {
   /// The directority where Grand Central generated collateral (modules,
