@@ -891,6 +891,93 @@ OpFoldResult OrOp::fold(ArrayRef<Attribute> constants) {
       constants, [](APInt &a, const APInt &b) { a |= b; });
 }
 
+/// Merge concats in an or op when they have non-conflicting fields.
+static bool canonicalizeOrExclusiveConcat(OrOp op, PatternRewriter &rewriter) {
+  auto inputs = op.inputs();
+  auto size = inputs.size();
+  auto concat1 = inputs.back().getDefiningOp<ConcatOp>();
+  auto concat2 = inputs[size - 2].getDefiningOp<ConcatOp>();
+
+  if (!concat1 || !concat2)
+    return false;
+
+  auto knownBits1 = computeKnownBits(inputs.back());
+  auto knownBits2 = computeKnownBits(inputs[size - 2]);
+  auto unknownBits1 = ~(knownBits1.Zero | knownBits1.One);
+  auto unknownBits2 = ~(knownBits2.Zero | knownBits2.One);
+  bool anyUnknownBitsOverlap = !(unknownBits1 & unknownBits2).isNullValue();
+  bool anyConstantOne = !(knownBits1.One | knownBits2.One).isNullValue();
+
+  // We can simplify only if unknown bits do not overlap. We don't handle the
+  // case where a constant 1 is present anywhere yet.
+  if (anyUnknownBitsOverlap || anyConstantOne)
+    return false;
+
+  SmallVector<Value> newConcatOperands;
+
+  // Simultaneously iterate over the operands of both concat ops, from MSB to
+  // LSB, pushing ranges of bits out at a time. Note that when we only use up
+  // part of a constant value, we mutate the operands array with a truncated
+  // version of the constant.
+  SmallVector<Value> operands1 = concat1->getOperands();
+  SmallVector<Value> operands2 = concat2->getOperands();
+  auto *it1 = operands1.begin();
+  auto *it2 = operands2.begin();
+  auto *end1 = operands1.end();
+  auto *end2 = operands2.end();
+  while (it1 != end1 && it2 != end2) {
+    auto operand1 = (*it1);
+    auto operand2 = (*it2);
+    auto cst1 = operand1.getDefiningOp<hw::ConstantOp>();
+    auto cst2 = operand2.getDefiningOp<hw::ConstantOp>();
+    auto width1 = hw::getBitWidth(operand1.getType());
+    auto width2 = hw::getBitWidth(operand2.getType());
+    if (cst1 && cst2) {
+      // Both operands are constant 0s, so pop off the narrower one and truncate
+      // the other.
+      auto minWidth = std::min(width1, width2);
+      newConcatOperands.push_back(
+          rewriter.create<hw::ConstantOp>(op.getLoc(), APInt(minWidth, 0)));
+      if (width1 > minWidth)
+        *it1 = rewriter.create<hw::ConstantOp>(
+            cst1.getLoc(), cst1.getValue().trunc(width1 - minWidth));
+      else
+        it1++;
+      if (width2 > minWidth)
+        *it2 = rewriter.create<hw::ConstantOp>(
+            cst2.getLoc(), cst2.getValue().trunc(width2 - minWidth));
+      else
+        it2++;
+    } else if (cst1 && !cst2) {
+      // Only one operand is a constant 0, so push the non-zero operand.
+      newConcatOperands.push_back(operand2);
+      if (width1 > width2)
+        *it1 = rewriter.create<hw::ConstantOp>(
+            cst1.getLoc(), cst1.getValue().trunc(width1 - width2));
+      else
+        it1++;
+      it2++;
+    } else if (!cst1 && cst2) {
+      // Only one operand is a constant 0, so push the non-zero operand.
+      newConcatOperands.push_back(operand1);
+      it1++;
+      if (width2 > width1)
+        *it2 = rewriter.create<hw::ConstantOp>(
+            cst2.getLoc(), cst2.getValue().trunc(width2 - width1));
+      else
+        it2++;
+    } else
+      llvm_unreachable("neither operand is a constant, should not be possible "
+                       "due to checking the known bits earlier");
+  }
+
+  ConcatOp newOp = rewriter.create<ConcatOp>(op.getLoc(), newConcatOperands);
+  SmallVector<Value> newOrOperands(inputs.drop_back(/*n=*/2));
+  newOrOperands.push_back(newOp);
+  rewriter.replaceOpWithNewOp<OrOp>(op, op.getType(), newOrOperands);
+  return true;
+}
+
 LogicalResult OrOp::canonicalize(OrOp op, PatternRewriter &rewriter) {
   auto inputs = op.inputs();
   auto size = inputs.size();
@@ -933,6 +1020,11 @@ LogicalResult OrOp::canonicalize(OrOp op, PatternRewriter &rewriter) {
 
   // or(x, or(...)) -> or(x, ...) -- flatten
   if (tryFlatteningOperands(op, rewriter))
+    return success();
+
+  // or(..., concat(x, cst1), concat(cst2, y)
+  //    ==> or(..., concat(x, cst3, y)), when x and y don't overlap.
+  if (canonicalizeOrExclusiveConcat(op, rewriter))
     return success();
 
   /// TODO: or(..., x, not(x)) -> or(..., '1) -- complement
