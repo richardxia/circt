@@ -24,8 +24,11 @@
 
 using namespace circt;
 using namespace firrtl;
+using llvm::Optional;
 using llvm::PointerSumType;
 using llvm::PointerSumTypeMember;
+using llvm::SmallString;
+using llvm::StringSwitch;
 
 //===----------------------------------------------------------------------===//
 // Pass Implementation
@@ -62,7 +65,7 @@ static SumType fromDict(DictionaryAttr *dict) {
   auto classBase = clazz.getValue();
   classBase.consume_front("sifive.enterprise.grandcentral.Augmented");
 
-  auto kind = llvm::StringSwitch<Kind::Kind>(classBase)
+  auto kind = StringSwitch<Kind::Kind>(classBase)
                   .Case("BundleType", Kind::Bundle)
                   .Case("VectorType", Kind::Vector)
                   .Case("GroundType", Kind::Ground)
@@ -119,6 +122,7 @@ struct Bundle {
 struct Vector {
   StringAttr name;
   ArrayAttr elements;
+
   static Vector fromSumType(SumType a) {
     auto *dict = a.get<Kind::Vector>();
     assert(dict && "input must be a Vector type");
@@ -130,6 +134,7 @@ struct Vector {
 struct Ground {
   IntegerAttr id;
   StringAttr name;
+
   static Ground fromSumType(SumType a) {
     auto *dict = a.get<Kind::Ground>();
     assert(dict && "input must be a Ground type");
@@ -142,6 +147,7 @@ struct Unsupported {
   StringAttr clazz;
   StringAttr name;
   DictionaryAttr *underlying;
+
   static Unsupported fromSumType(SumType a) {
     auto *dict = a.get<Kind::Unsupported>();
     assert(dict && "input must be an Unsupported type");
@@ -153,8 +159,8 @@ struct Unsupported {
 struct CircuitNamespace {
 
 private:
-  llvm::StringSet<> internal;
-  CircuitNamespace(llvm::StringSet<> internal) : internal(internal) {}
+  StringSet<> internal;
+  CircuitNamespace(StringSet<> internal) : internal(internal) {}
 
 public:
   CircuitNamespace(CircuitOp op) {
@@ -232,28 +238,29 @@ struct GrandCentralPass : public GrandCentralBase<GrandCentralPass> {
 
 private:
   // Mapping of ID to leaf graound type associated with that ID.
-  llvm::DenseMap<Attribute, Value> leafMap;
+  DenseMap<Attribute, Value> leafMap;
 
   // Mapping of ID to parent instance and module.
-  llvm::DenseMap<Attribute, std::pair<InstanceOp, FModuleOp>> parentIDMap;
+  DenseMap<Attribute, std::pair<InstanceOp, FModuleOp>> parentIDMap;
 
   // Mapping of ID to companion module.
-  llvm::DenseMap<Attribute, CompanionInfo> companionIDMap;
+  DenseMap<Attribute, CompanionInfo> companionIDMap;
 
   bool traverseField(SumType field, IntegerAttr id, Twine path);
 
-  std::variant<llvm::SmallString<0>, SumType, Type>
+  std::variant<SmallString<0>, SumType, Type>
   computeField(SumType field, IntegerAttr id, Twine path);
 
+  bool walkBundle(Bundle bundle, IntegerAttr id = {}, Twine path = {});
+
   Optional<sv::InterfaceOp> traverseBundle(Bundle bundle, IntegerAttr id = {},
-                                           Twine path = {},
-                                           bool buildIFace = false);
+                                           Twine path = {});
 
   FModuleLike getEnclosingModule(Value value);
 
   // Inforamtion about how the circuit should be extracted.  This will be
   // non-empty if an extraction annotation is found.
-  llvm::Optional<ExtractionInfo> maybeExtractInfo = None;
+  Optional<ExtractionInfo> maybeExtractInfo = None;
 
   StringRef getOutputDirectory() {
     return maybeExtractInfo ? maybeExtractInfo.getValue().directory : ".";
@@ -325,10 +332,7 @@ bool GrandCentralPass::traverseField(SumType field, IntegerAttr id,
   }
   case Kind::Bundle: {
     auto bundle = Bundle::fromSumType(field);
-    auto iface = traverseBundle(bundle, id, path, false);
-    if (!iface || !iface.getValue())
-      return false;
-    return true;
+    return walkBundle(bundle, id, path);
   }
   case Kind::Unsupported: {
     return true;
@@ -383,7 +387,7 @@ GrandCentralPass::computeField(SumType field, IntegerAttr id, Twine path) {
   }
   case Kind::Bundle: {
     auto bundle = Bundle::fromSumType(field);
-    auto iface = traverseBundle(bundle, id, path, true);
+    auto iface = traverseBundle(bundle, id, path);
     assert(iface && iface.getValue());
     return SmallString<0>(
         (iface.getValue().getName() + " " + iface.getValue().getName()).str());
@@ -396,71 +400,79 @@ GrandCentralPass::computeField(SumType field, IntegerAttr id, Twine path) {
   }
 }
 
+bool GrandCentralPass::walkBundle(Bundle bundle, IntegerAttr id, Twine path) {
+  bool anyFailed = true;
+  for (auto element : bundle.elements) {
+    DictionaryAttr field = element.dyn_cast<DictionaryAttr>();
+    if (!field)
+      return false;
+    auto name = field.getAs<StringAttr>("name");
+    if (!name)
+      name = field.getAs<StringAttr>("defName");
+    anyFailed &=
+        traverseField(fromDict(&field), id,
+                      path.isTriviallyEmpty()
+                          ? bundle.defName.getValue() + "." + name.getValue()
+                          : path + "." + name.getValue());
+  }
+
+  return anyFailed;
+}
+
 /// Traverse an Annotation that is an AugmentedBundleType.  During
 /// traversal, construct any discovered SystemVerilog interfaces.  If this
 /// is the root interface, instantiate that interface in the parent. Recurse
 /// into fields of the AugmentedBundleType to construct nested interfaces
 /// and generate stringy-typed SystemVerilog hierarchical references to
 /// drive the interface. Returns false on any failure and true on success.
-///
-/// This is a normal tree traversal with dual effects.  This traversal will
-/// always generate the hierarchical refernces (as these are located at the
-/// leaves of the Annotation).  However, this only generates the interface
-/// if the `buildIFace` parameter is true.  This is done to prevent
-/// interface construction for every element of a vector (and instead just
-/// create one interface for the whole vector).
-Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Bundle bundle,
-                                                           IntegerAttr id,
-                                                           Twine path,
-                                                           bool buildIFace) {
+Optional<sv::InterfaceOp>
+GrandCentralPass::traverseBundle(Bundle bundle, IntegerAttr id, Twine path) {
   auto builder = OpBuilder::atBlockEnd(getOperation().getBody());
   sv::InterfaceOp iface;
-  if (buildIFace) {
-    builder.setInsertionPointToEnd(getOperation().getBody());
-    auto loc = getOperation().getLoc();
-    auto iFaceName = circuitNamespaceRef->newName(bundle.defName.getValue());
-    iface = builder.create<sv::InterfaceOp>(loc, iFaceName);
-    iface->setAttr("output_file",
-                   hw::OutputFileAttr::get(
-                       builder.getStringAttr(getOutputDirectory()),
-                       builder.getStringAttr(iFaceName + ".sv"),
-                       builder.getBoolAttr(true), builder.getBoolAttr(true),
-                       builder.getContext()));
+  builder.setInsertionPointToEnd(getOperation().getBody());
+  auto loc = getOperation().getLoc();
+  auto iFaceName = circuitNamespaceRef->newName(bundle.defName.getValue());
+  iface = builder.create<sv::InterfaceOp>(loc, iFaceName);
+  iface->setAttr(
+      "output_file",
+      hw::OutputFileAttr::get(builder.getStringAttr(getOutputDirectory()),
+                              builder.getStringAttr(iFaceName + ".sv"),
+                              builder.getBoolAttr(true),
+                              builder.getBoolAttr(true), builder.getContext()));
 
-    // If this is the root interface, then it needs to be instantiated in the
-    // parent.
-    if (bundle.isRoot()) {
-      builder.setInsertionPointToEnd(
-          parentIDMap.lookup(id).second.getBodyBlock());
-      auto symbolName = circuitNamespaceRef->newName(
-          ("__" + companionIDMap.lookup(id).name + "_" +
-           bundle.defName.getValue() + "__"));
-      llvm::errs() << "Try to add symbol: " << symbolName << "\n";
-      auto instance = builder.create<sv::InterfaceInstanceOp>(
-          loc, iface.getInterfaceType(), companionIDMap.lookup(id).name,
-          builder.getStringAttr(symbolName));
+  // If this is the root interface, then it needs to be instantiated in the
+  // parent.
+  if (bundle.isRoot()) {
+    builder.setInsertionPointToEnd(
+        parentIDMap.lookup(id).second.getBodyBlock());
+    auto symbolName =
+        circuitNamespaceRef->newName(("__" + companionIDMap.lookup(id).name +
+                                      "_" + bundle.defName.getValue() + "__"));
+    llvm::errs() << "Try to add symbol: " << symbolName << "\n";
+    auto instance = builder.create<sv::InterfaceInstanceOp>(
+        loc, iface.getInterfaceType(), companionIDMap.lookup(id).name,
+        builder.getStringAttr(symbolName));
 
-      // If there was no bind file passed in, then we're not supposed to
-      // extract this.  Delete the annotation and continue.
-      if (maybeExtractInfo) {
+    // If there was no bind file passed in, then we're not supposed to
+    // extract this.  Delete the annotation and continue.
+    if (maybeExtractInfo) {
 
-        instance->setAttr("doNotPrint", builder.getBoolAttr(true));
-        builder.setInsertionPointToStart(
-            instance->getParentOfType<ModuleOp>().getBody());
-        auto bind = builder.create<sv::BindInterfaceOp>(
-            loc, builder.getSymbolRefAttr(instance.sym_name().getValue()));
-        bind->setAttr(
-            "output_file",
-            hw::OutputFileAttr::get(
-                builder.getStringAttr(""),
-                builder.getStringAttr(maybeExtractInfo.getValue().bindFilename),
-                builder.getBoolAttr(true), builder.getBoolAttr(true),
-                bind.getContext()));
-      }
+      instance->setAttr("doNotPrint", builder.getBoolAttr(true));
+      builder.setInsertionPointToStart(
+          instance->getParentOfType<ModuleOp>().getBody());
+      auto bind = builder.create<sv::BindInterfaceOp>(
+          loc, builder.getSymbolRefAttr(instance.sym_name().getValue()));
+      bind->setAttr(
+          "output_file",
+          hw::OutputFileAttr::get(
+              builder.getStringAttr(""),
+              builder.getStringAttr(maybeExtractInfo.getValue().bindFilename),
+              builder.getBoolAttr(true), builder.getBoolAttr(true),
+              bind.getContext()));
     }
-
-    builder.setInsertionPointToEnd(cast<sv::InterfaceOp>(iface).getBodyBlock());
   }
+
+  builder.setInsertionPointToEnd(cast<sv::InterfaceOp>(iface).getBodyBlock());
 
   for (auto element : bundle.elements) {
     DictionaryAttr field = element.dyn_cast<DictionaryAttr>();
@@ -477,44 +489,42 @@ Optional<sv::InterfaceOp> GrandCentralPass::traverseBundle(Bundle bundle,
                          ? bundle.defName.getValue() + "." + name.getValue()
                          : path + "." + name.getValue());
 
-    if (buildIFace) {
-      auto uloc = builder.getUnknownLoc();
-      auto description = field.getAs<StringAttr>("description");
-      if (description)
-        builder.create<sv::VerbatimOp>(uloc,
-                                       ("// " + description.getValue()).str());
-      if (auto *str = std::get_if<SmallString<0>>(&elementType)) {
-        builder.create<sv::VerbatimOp>(uloc, str->str() + "();");
-        continue;
-      }
-
-      if (auto *ptr = std::get_if<SumType>(&elementType)) {
-        auto unsupported = Unsupported::fromSumType(*ptr);
-        auto classBase = unsupported.clazz.getValue();
-        classBase.consume_front("sifive.enterprise.grandcentral.Augmented");
-        if (classBase == "StringType") {
-          builder.create<sv::VerbatimOp>(uloc,
-                                         "// " + unsupported.name.getValue() +
-                                             " = <unsupported string type>;");
-        } else if (classBase == "BooleanType") {
-          builder.create<sv::VerbatimOp>(uloc,
-                                         "// " + unsupported.name.getValue() +
-                                             " = <unsupported boolean type>;");
-        } else if (classBase == "IntegerType") {
-          builder.create<sv::VerbatimOp>(uloc,
-                                         "// " + unsupported.name.getValue() +
-                                             " = <unsupported integer type>;");
-        } else if (classBase == "DoubleType") {
-          builder.create<sv::VerbatimOp>(uloc,
-                                         "// " + unsupported.name.getValue() +
-                                             " = <unsupported double type>;");
-        }
-        continue;
-      }
-
-      builder.create<sv::InterfaceSignalOp>(uloc, name.getValue(),
-                                            std::get<Type>(elementType));
+    auto uloc = builder.getUnknownLoc();
+    auto description = field.getAs<StringAttr>("description");
+    if (description)
+      builder.create<sv::VerbatimOp>(uloc,
+                                     ("// " + description.getValue()).str());
+    if (auto *str = std::get_if<SmallString<0>>(&elementType)) {
+      builder.create<sv::VerbatimOp>(uloc, str->str() + "();");
+      continue;
     }
+
+    if (auto *ptr = std::get_if<SumType>(&elementType)) {
+      auto unsupported = Unsupported::fromSumType(*ptr);
+      auto classBase = unsupported.clazz.getValue();
+      classBase.consume_front("sifive.enterprise.grandcentral.Augmented");
+      if (classBase == "StringType") {
+        builder.create<sv::VerbatimOp>(uloc,
+                                       "// " + unsupported.name.getValue() +
+                                           " = <unsupported string type>;");
+      } else if (classBase == "BooleanType") {
+        builder.create<sv::VerbatimOp>(uloc,
+                                       "// " + unsupported.name.getValue() +
+                                           " = <unsupported boolean type>;");
+      } else if (classBase == "IntegerType") {
+        builder.create<sv::VerbatimOp>(uloc,
+                                       "// " + unsupported.name.getValue() +
+                                           " = <unsupported integer type>;");
+      } else if (classBase == "DoubleType") {
+        builder.create<sv::VerbatimOp>(uloc,
+                                       "// " + unsupported.name.getValue() +
+                                           " = <unsupported double type>;");
+      }
+      continue;
+    }
+
+    builder.create<sv::InterfaceSignalOp>(uloc, name.getValue(),
+                                          std::get<Type>(elementType));
   }
 
   return iface;
@@ -871,7 +881,7 @@ void GrandCentralPass::runOnOperation() {
       return false;
     }
     if (!traverseBundle(bundle, bundle.id,
-                        companionIDMap.lookup(bundle.id).name, true)) {
+                        companionIDMap.lookup(bundle.id).name)) {
       emitCircuitError(
           "'firrtl.circuit' op contained an 'AugmentedBundleType' "
           "Annotation which did not conform to the expected format")
