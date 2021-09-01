@@ -182,43 +182,6 @@ public:
   SmallString<0> newName(Twine name) { return newNameImpl(name.str()); }
 };
 
-/// The data content of an AugmentedBundleType.
-struct BundleType {
-  StringAttr defName;
-  ArrayAttr elements;
-  IntegerAttr id;
-
-  /// Optionally construct a BundleType from an Annotation, returning None if
-  /// the Annotation doesn't match the expected format.
-  static Optional<BundleType> fromAnno(Annotation annotation) {
-    auto defName = annotation.getMember<StringAttr>("defName");
-    auto elements = annotation.getMember<ArrayAttr>("elements");
-    bool failed = false;
-    if (!defName) {
-      llvm::errs() << "invalid 'AugmentedBundleType': missing 'defName' in "
-                   << annotation.getDict();
-      failed = true;
-    }
-    if (!elements) {
-      llvm::errs() << "invalid 'AugmentedBundleType': missing 'defName' in "
-                   << annotation.getDict();
-      failed = true;
-    }
-    if (failed)
-      return None;
-
-    return BundleType(
-        {defName, elements, annotation.getMember<IntegerAttr>("id")});
-  }
-
-  /// Return true if this AugmentedBundleType (a SystemVerilog interface) that
-  /// is a top-level interface.  Or: this returns false if this interface is
-  /// instantitate by another interface.  This works because only the outermost
-  /// AugmentedBundleType has an ID.  This invariant is established due to
-  /// annotations scattering logic.
-  bool isRoot() { return id != nullptr; }
-};
-
 /// Stores the information content of an ExtractGrandCentralAnnotation.
 struct ExtractionInfo {
   /// The directority where Grand Central generated collateral (modules,
