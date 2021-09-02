@@ -936,15 +936,15 @@ static bool canonicalizeOrExclusiveConcat(OrOp op, PatternRewriter &rewriter) {
       // Both operands are constant 0s, so pop off the narrower one and truncate
       // the other.
       auto minWidth = std::min(width1, width2);
-      newConcatOperands.push_back(
-          rewriter.create<hw::ConstantOp>(op.getLoc(), APInt(minWidth, 0)));
+      newConcatOperands.push_back(rewriter.createOrFold<hw::ConstantOp>(
+          op.getLoc(), APInt(minWidth, 0)));
       if (width1 > minWidth)
-        *it1 = rewriter.create<hw::ConstantOp>(
+        *it1 = rewriter.createOrFold<hw::ConstantOp>(
             cst1.getLoc(), cst1.getValue().trunc(width1 - minWidth));
       else
         ++it1;
       if (width2 > minWidth)
-        *it2 = rewriter.create<hw::ConstantOp>(
+        *it2 = rewriter.createOrFold<hw::ConstantOp>(
             cst2.getLoc(), cst2.getValue().trunc(width2 - minWidth));
       else
         ++it2;
@@ -952,7 +952,7 @@ static bool canonicalizeOrExclusiveConcat(OrOp op, PatternRewriter &rewriter) {
       // Only one operand is a constant 0, so push the non-zero operand.
       newConcatOperands.push_back(operand2);
       if (width1 > width2)
-        *it1 = rewriter.create<hw::ConstantOp>(
+        *it1 = rewriter.createOrFold<hw::ConstantOp>(
             cst1.getLoc(), cst1.getValue().trunc(width1 - width2));
       else
         ++it1;
@@ -962,7 +962,7 @@ static bool canonicalizeOrExclusiveConcat(OrOp op, PatternRewriter &rewriter) {
       newConcatOperands.push_back(operand1);
       ++it1;
       if (width2 > width1)
-        *it2 = rewriter.create<hw::ConstantOp>(
+        *it2 = rewriter.createOrFold<hw::ConstantOp>(
             cst2.getLoc(), cst2.getValue().trunc(width2 - width1));
       else
         ++it2;
