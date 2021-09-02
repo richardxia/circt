@@ -892,17 +892,19 @@ OpFoldResult OrOp::fold(ArrayRef<Attribute> constants) {
 }
 
 /// Merge concats in an or op when they have non-conflicting fields.
-static bool canonicalizeOrExclusiveConcat(OrOp op, PatternRewriter &rewriter) {
+static bool canonicalizeOrExclusiveConcat(OrOp op, size_t concatIdx1,
+                                          size_t concatIdx2,
+                                          PatternRewriter &rewriter) {
+  assert(concatIdx1 < concatIdx2 && "concatIdx1 must be < concatIdx2");
+
   auto inputs = op.inputs();
-  auto size = inputs.size();
-  auto concat1 = inputs.back().getDefiningOp<ConcatOp>();
-  auto concat2 = inputs[size - 2].getDefiningOp<ConcatOp>();
+  auto concat1 = inputs[concatIdx1].getDefiningOp<ConcatOp>();
+  auto concat2 = inputs[concatIdx2].getDefiningOp<ConcatOp>();
 
-  if (!concat1 || !concat2)
-    return false;
+  assert(concat1 && concat2 && "expected indexes to point to ConcatOps");
 
-  auto knownBits1 = computeKnownBits(inputs.back());
-  auto knownBits2 = computeKnownBits(inputs[size - 2]);
+  auto knownBits1 = computeKnownBits(inputs[concatIdx1]);
+  auto knownBits2 = computeKnownBits(inputs[concatIdx2]);
   auto unknownBits1 = ~(knownBits1.Zero | knownBits1.One);
   auto unknownBits2 = ~(knownBits2.Zero | knownBits2.One);
   bool anyUnknownBitsOverlap = !(unknownBits1 & unknownBits2).isNullValue();
@@ -972,8 +974,17 @@ static bool canonicalizeOrExclusiveConcat(OrOp op, PatternRewriter &rewriter) {
   }
 
   ConcatOp newOp = rewriter.create<ConcatOp>(op.getLoc(), newConcatOperands);
-  SmallVector<Value> newOrOperands(inputs.drop_back(/*n=*/2));
+
+  // Copy the old operands except for concatIdx1 and concatIdx2, and append the
+  // new ConcatOp to the end.
+  SmallVector<Value> newOrOperands;
+  newOrOperands.append(inputs.begin(), inputs.begin() + concatIdx1);
+  newOrOperands.append(inputs.begin() + concatIdx1 + 1,
+                       inputs.begin() + concatIdx2);
+  newOrOperands.append(inputs.begin() + concatIdx2 + 1,
+                       inputs.begin() + inputs.size());
   newOrOperands.push_back(newOp);
+
   rewriter.replaceOpWithNewOp<OrOp>(op, op.getType(), newOrOperands);
   return true;
 }
@@ -1024,8 +1035,13 @@ LogicalResult OrOp::canonicalize(OrOp op, PatternRewriter &rewriter) {
 
   // or(..., concat(x, cst1), concat(cst2, y)
   //    ==> or(..., concat(x, cst3, y)), when x and y don't overlap.
-  if (canonicalizeOrExclusiveConcat(op, rewriter))
-    return success();
+  for (size_t i = 0; i < size - 1; ++i) {
+    if (auto concat = inputs[i].getDefiningOp<ConcatOp>())
+      for (size_t j = i + 1; j < size; ++j)
+        if (auto concat = inputs[j].getDefiningOp<ConcatOp>())
+          if (canonicalizeOrExclusiveConcat(op, i, j, rewriter))
+            return success();
+  }
 
   /// TODO: or(..., x, not(x)) -> or(..., '1) -- complement
   return failure();
