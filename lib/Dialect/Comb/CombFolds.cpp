@@ -942,12 +942,12 @@ static bool canonicalizeOrExclusiveConcat(OrOp op, PatternRewriter &rewriter) {
         *it1 = rewriter.create<hw::ConstantOp>(
             cst1.getLoc(), cst1.getValue().trunc(width1 - minWidth));
       else
-        it1++;
+        ++it1;
       if (width2 > minWidth)
         *it2 = rewriter.create<hw::ConstantOp>(
             cst2.getLoc(), cst2.getValue().trunc(width2 - minWidth));
       else
-        it2++;
+        ++it2;
     } else if (cst1 && !cst2) {
       // Only one operand is a constant 0, so push the non-zero operand.
       newConcatOperands.push_back(operand2);
@@ -955,17 +955,17 @@ static bool canonicalizeOrExclusiveConcat(OrOp op, PatternRewriter &rewriter) {
         *it1 = rewriter.create<hw::ConstantOp>(
             cst1.getLoc(), cst1.getValue().trunc(width1 - width2));
       else
-        it1++;
-      it2++;
+        ++it1;
+      ++it2;
     } else if (!cst1 && cst2) {
       // Only one operand is a constant 0, so push the non-zero operand.
       newConcatOperands.push_back(operand1);
-      it1++;
+      ++it1;
       if (width2 > width1)
         *it2 = rewriter.create<hw::ConstantOp>(
             cst2.getLoc(), cst2.getValue().trunc(width2 - width1));
       else
-        it2++;
+        ++it2;
     } else
       llvm_unreachable("neither operand is a constant, should not be possible "
                        "due to checking the known bits earlier");
