@@ -921,15 +921,19 @@ static bool canonicalizeOrExclusiveConcat(OrOp op, size_t concatIdx1,
   // LSB, pushing ranges of bits out at a time. Note that when we only use up
   // part of a constant value, we mutate the operands array with a truncated
   // version of the constant.
-  SmallVector<Value> operands1 = concat1->getOperands();
-  SmallVector<Value> operands2 = concat2->getOperands();
-  auto *it1 = operands1.begin();
-  auto *it2 = operands2.begin();
-  auto *end1 = operands1.end();
-  auto *end2 = operands2.end();
+  auto operands1 = concat1->getOperands();
+  auto operands2 = concat2->getOperands();
+  auto it1 = operands1.begin();
+  auto it2 = operands2.begin();
+  auto end1 = operands1.end();
+  auto end2 = operands2.end();
+  Value operand1;
+  Value operand2;
+  if (it1 != end1)
+    operand1 = *it1;
+  if (it2 != end2)
+    operand2 = *it2;
   while (it1 != end1 && it2 != end2) {
-    auto operand1 = (*it1);
-    auto operand2 = (*it2);
     auto cst1 = operand1.getDefiningOp<hw::ConstantOp>();
     auto cst2 = operand2.getDefiningOp<hw::ConstantOp>();
     auto width1 = hw::getBitWidth(operand1.getType());
@@ -941,33 +945,49 @@ static bool canonicalizeOrExclusiveConcat(OrOp op, size_t concatIdx1,
       newConcatOperands.push_back(rewriter.createOrFold<hw::ConstantOp>(
           op.getLoc(), APInt(minWidth, 0)));
       if (width1 > minWidth)
-        *it1 = rewriter.createOrFold<hw::ConstantOp>(
+        operand1 = rewriter.createOrFold<hw::ConstantOp>(
             cst1.getLoc(), cst1.getValue().trunc(width1 - minWidth));
-      else
+      else {
         ++it1;
+        if (it1 != end1)
+          operand1 = *it1;
+      }
       if (width2 > minWidth)
-        *it2 = rewriter.createOrFold<hw::ConstantOp>(
+        operand2 = rewriter.createOrFold<hw::ConstantOp>(
             cst2.getLoc(), cst2.getValue().trunc(width2 - minWidth));
-      else
+      else {
         ++it2;
+        if (it2 != end2)
+          operand2 = *it2;
+      }
     } else if (cst1 && !cst2) {
       // Only one operand is a constant 0, so push the non-zero operand.
       newConcatOperands.push_back(operand2);
       if (width1 > width2)
-        *it1 = rewriter.createOrFold<hw::ConstantOp>(
+        operand1 = rewriter.createOrFold<hw::ConstantOp>(
             cst1.getLoc(), cst1.getValue().trunc(width1 - width2));
-      else
+      else {
         ++it1;
+        if (it1 != end1)
+          operand1 = *it1;
+      }
       ++it2;
+      if (it2 != end2)
+        operand2 = *it2;
     } else if (!cst1 && cst2) {
       // Only one operand is a constant 0, so push the non-zero operand.
       newConcatOperands.push_back(operand1);
       ++it1;
+      if (it1 != end1)
+        operand1 = *it1;
       if (width2 > width1)
-        *it2 = rewriter.createOrFold<hw::ConstantOp>(
+        operand2 = rewriter.createOrFold<hw::ConstantOp>(
             cst2.getLoc(), cst2.getValue().trunc(width2 - width1));
-      else
+      else {
         ++it2;
+        if (it2 != end2)
+          operand2 = *it2;
+      }
     } else
       llvm_unreachable("neither operand is a constant, should not be possible "
                        "due to checking the known bits earlier");
