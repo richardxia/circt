@@ -17,15 +17,10 @@ jobs:
   build_wheels:
     name: Build wheels with ${{ matrix.config.cibw_build }}
     runs-on: ${{ matrix.config.os }}
-    if: github.repository == 'llvm/circt'
     strategy:
       fail-fast: false
       matrix:
         config:
-          - os: ubuntu-22.04
-            cibw_build: cp310-manylinux_x86_64
-          - os: ubuntu-22.04
-            cibw_build: cp313-manylinux_x86_64
           - os: ubuntu-22.04
             cibw_build: cp314-manylinux_x86_64
 
